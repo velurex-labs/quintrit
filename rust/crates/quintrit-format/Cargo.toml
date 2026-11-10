@@ -1,0 +1,19 @@
+[package]
+name = "quintrit-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "GGUF model reader and dynamic in-memory transcoder into 1.60 bpw Velurex format"
+
+[dependencies]
+quintrit-core = { path = "../quintrit-core", version = "0.1.0" }
+memmap2 = "0.9"
+rayon = "1.10"
+
+[dev-dependencies]
+byteorder = "1.5"

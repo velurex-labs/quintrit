@@ -1,0 +1,47 @@
+[package]
+name = "quintrit-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "High-performance transformer inference engine and CLI for 1.60 bpw Velurex quantized models"
+
+[dependencies]
+quintrit-core = { path = "../quintrit-core", version = "0.1.0" }
+quintrit-format = { path = "../quintrit-format", version = "0.1.0" }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+ahash = "0.8"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Comparison baseline (Rust only, not published): the BitNet kernels, enabled with the feature `bitnet-baseline`.
+quintrit-bitnet = { path = "../quintrit-bitnet", optional = true }
+
+[features]
+default = []
+# Adds the BitNet kernels `BitnetMad` and `BitnetMad512` (4 trits per byte) to compare them with the quintrit kernels.
+bitnet-baseline = ["dep:quintrit-bitnet"]
+
+[[bin]]
+name = "quintrit"
+path = "src/bin/quintrit.rs"
+
+[[bench]]
+name = "e2e_avx2_neon_bench"
+harness = false
+
+[[bench]]
+name = "e2e_avx512_bench"
+harness = false
+
+[[bench]]
+name = "token_profile"
+harness = false
+
+[[bench]]
+name = "token_energy"
+harness = false

@@ -1,0 +1,9 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Benchmark reports written by the benchmark programs (the published numbers are in docs/benchmarks.md)
+results/
+
+# Model weights downloaded for the benchmarks (see docs/benchmarks.md)
+models/

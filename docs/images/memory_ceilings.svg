@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 200" role="img" aria-label="Memory bandwidth ceilings">
+<style>.bg{fill:#ffffff}.t{font:13px sans-serif;fill:#24292f}.bar{fill:#2f6fba}.peak{stroke:#c0392b;stroke-width:2}.n{font:12px sans-serif;fill:#57606a}@media (prefers-color-scheme:dark){.bg{fill:#0d1117}.t{fill:#e6edf3}.bar{fill:#58a6ff}.peak{stroke:#ff7b72}.n{fill:#9da7b3}}</style>
+<rect width="760" height="200" class="bg"/>
+<text x="240" y="48" text-anchor="end" class="t">Raspberry Pi 5</text>
+<rect x="250" y="30" width="70.5" height="26" class="bar"/>
+<text x="326.5" y="48" class="t">13.8 GB/s</text>
+<line x1="337.3" y1="27" x2="337.3" y2="59" class="peak"/>
+<text x="240" y="88" text-anchor="end" class="t">Azure Neoverse-N2 VM</text>
+<rect x="250" y="70" width="400.0" height="26" class="bar"/>
+<text x="656.0" y="88" class="t">78.3 GB/s</text>
+<text x="240" y="128" text-anchor="end" class="t">Intel Core i7-7700</text>
+<rect x="250" y="110" width="176.9" height="26" class="bar"/>
+<text x="432.9" y="128" class="t">34.6 GB/s</text>
+<line x1="446.1" y1="107" x2="446.1" y2="139" class="peak"/>
+<text x="240" y="168" text-anchor="end" class="t">AMD EPYC 9V45</text>
+<rect x="250" y="150" width="273.2" height="26" class="bar"/>
+<text x="529.2" y="168" class="t">53.5 GB/s</text>
+<text x="250" y="192" class="n">Memory-read ceiling per machine; the red mark is the theoretical DRAM peak where it is known.</text>
+</svg>

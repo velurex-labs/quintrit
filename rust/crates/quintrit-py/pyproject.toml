@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "quintrit"
+description = "Python bindings for the Quintrit 1.60 bpw ternary SDK (5 trits per byte, SIMD GEMV kernels)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy>=1.21"]
+dynamic = ["version"]
+keywords = ["ternary", "quantization", "llm", "simd", "bitnet"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.maturin]
+# Mixed layout: pure-Python layer in python/quintrit, compiled module quintrit._native.
+python-source = "python"
+module-name = "quintrit._native"
+features = ["pyo3/extension-module"]
+strip = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

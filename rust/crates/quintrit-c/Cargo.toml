@@ -1,0 +1,27 @@
+[package]
+name = "quintrit-c"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "C ABI (libquintrit_c / quintrit_c.dll) for the Quintrit ternary kernels, format readers and inference runtime"
+
+[lib]
+# The shared and the static library are called `libquintrit_c` / `quintrit_c.dll`. The name differs from the `quintrit`
+# command-line binary of quintrit-runtime on purpose: equal output names collide (one `quintrit.pdb` on Windows). The
+# rlib is what the Rust tests link. The C symbols and the header keep the `quintrit_` prefix.
+name = "quintrit_c"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+quintrit-core = { path = "../quintrit-core", version = "0.1.0" }
+quintrit-format = { path = "../quintrit-format", version = "0.1.0" }
+quintrit-runtime = { path = "../quintrit-runtime", version = "0.1.0" }
+
+[dev-dependencies]
+# Locates a C / C++ compiler (and the MSVC environment) for the C and C++ tests; the tests skip without one.
+cc = "1"

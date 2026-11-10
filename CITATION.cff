@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software or the velurex encoding in your work, please cite it as below."
+title: "Quintrit"
+abstract: "Ternary-weight inference with velurex encoding: five trits per byte (1.60 bits per weight), exact SIMD kernels for AVX2, AVX-512 and NEON, a GGUF reader and a transformer runtime, with C, C++ and Python bindings."
+authors:
+  - family-names: "Velecký"
+    given-names: "Lukáš"
+license: Apache-2.0
+repository-code: "https://github.com/velurex-labs/quintrit"
+version: "0.1.0"
+keywords:
+  - ternary quantization
+  - velurex encoding
+  - SIMD
+  - LLM inference
+  - GGUF

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 348" role="img" aria-label="Relative speed of the quintrit kernels against the fastest BitNet kernel">
+<style>.bg{fill:#ffffff}.t{font:13px sans-serif;fill:#24292f}.n{font:12px sans-serif;fill:#57606a}.v{font:12px sans-serif;fill:#24292f;paint-order:stroke;stroke:#ffffff;stroke-width:4px;stroke-linejoin:round}.s1{fill:#2a78d6}.s2{fill:#eb6834}.grid{stroke:#d0d7de;stroke-width:1}.base{stroke:#24292f;stroke-width:1.5;stroke-dasharray:4 3}@media (prefers-color-scheme:dark){.bg{fill:#0d1117}.t,.v{fill:#e6edf3}.v{stroke:#0d1117}.n{fill:#9da7b3}.s1{fill:#3987e5}.s2{fill:#d95926}.grid{stroke:#30363d}.base{stroke:#e6edf3}}</style>
+<rect width="760" height="348" class="bg"/>
+<rect x="250" y="10" width="12" height="12" rx="2" class="s1"/><text x="268" y="20" class="t">1 thread</text>
+<rect x="350" y="10" width="12" height="12" rx="2" class="s2"/><text x="368" y="20" class="t">4 threads</text>
+<line x1="250.0" y1="42" x2="250.0" y2="308" class="grid"/>
+<text x="250.0" y="324" text-anchor="middle" class="n">0x</text>
+<line x1="340.0" y1="42" x2="340.0" y2="308" class="grid"/>
+<text x="340.0" y="324" text-anchor="middle" class="n">0.5x</text>
+<line x1="430.0" y1="42" x2="430.0" y2="308" class="base"/>
+<text x="430.0" y="324" text-anchor="middle" class="n">1x</text>
+<line x1="520.0" y1="42" x2="520.0" y2="308" class="grid"/>
+<text x="520.0" y="324" text-anchor="middle" class="n">1.5x</text>
+<line x1="610.0" y1="42" x2="610.0" y2="308" class="grid"/>
+<text x="610.0" y="324" text-anchor="middle" class="n">2x</text>
+<line x1="700.0" y1="42" x2="700.0" y2="308" class="grid"/>
+<text x="700.0" y="324" text-anchor="middle" class="n">2.5x</text>
+<text x="435.0" y="38" class="n">BitNet baseline = 1x</text>
+<text x="240" y="63" text-anchor="end" class="t">Raspberry Pi 5</text>
+<text x="240" y="81" text-anchor="end" class="n">NEON</text>
+<rect x="250" y="50" width="127.1" height="16" rx="2" class="s1"><title>Raspberry Pi 5, NEON, 1 thread: 0.71x</title></rect>
+<text x="382.1" y="62" class="v">0.71x</text>
+<rect x="250" y="68" width="243.7" height="16" rx="2" class="s2"><title>Raspberry Pi 5, NEON, 4 threads: 1.35x</title></rect>
+<text x="498.7" y="80" class="v">1.35x</text>
+<text x="240" y="117" text-anchor="end" class="t">Neoverse-N2 VM</text>
+<text x="240" y="135" text-anchor="end" class="n">NEON</text>
+<rect x="250" y="104" width="157.2" height="16" rx="2" class="s1"><title>Neoverse-N2 VM, NEON, 1 thread: 0.87x</title></rect>
+<text x="412.2" y="116" class="v">0.87x</text>
+<rect x="250" y="122" width="169.0" height="16" rx="2" class="s2"><title>Neoverse-N2 VM, NEON, 4 threads: 0.94x</title></rect>
+<text x="424.0" y="134" class="v">0.94x</text>
+<text x="240" y="171" text-anchor="end" class="t">Intel Core i7-7700</text>
+<text x="240" y="189" text-anchor="end" class="n">AVX2</text>
+<rect x="250" y="158" width="172.8" height="16" rx="2" class="s1"><title>Intel Core i7-7700, AVX2, 1 thread: 0.96x</title></rect>
+<text x="427.8" y="170" class="v">0.96x</text>
+<rect x="250" y="176" width="270.0" height="16" rx="2" class="s2"><title>Intel Core i7-7700, AVX2, 4 threads: 1.50x</title></rect>
+<text x="525.0" y="188" class="v">1.50x</text>
+<text x="240" y="225" text-anchor="end" class="t">AMD EPYC 9V45</text>
+<text x="240" y="243" text-anchor="end" class="n">AVX-512 vs. original AVX2 kernels</text>
+<rect x="250" y="212" width="383.2" height="16" rx="2" class="s1"><title>AMD EPYC 9V45, AVX-512 vs. original AVX2 kernels, 1 thread: 2.13x</title></rect>
+<text x="638.2" y="224" class="v">2.13x</text>
+<rect x="250" y="230" width="214.1" height="16" rx="2" class="s2"><title>AMD EPYC 9V45, AVX-512 vs. original AVX2 kernels, 4 threads: 1.19x</title></rect>
+<text x="469.1" y="242" class="v">1.19x</text>
+<text x="240" y="279" text-anchor="end" class="t">AMD EPYC 9V45</text>
+<text x="240" y="297" text-anchor="end" class="n">AVX-512 vs. AVX-512 port</text>
+<rect x="250" y="266" width="253.8" height="16" rx="2" class="s1"><title>AMD EPYC 9V45, AVX-512 vs. AVX-512 port, 1 thread: 1.41x</title></rect>
+<text x="508.8" y="278" class="v">1.41x</text>
+<rect x="250" y="284" width="242.9" height="16" rx="2" class="s2"><title>AMD EPYC 9V45, AVX-512 vs. AVX-512 port, 4 threads: 1.35x</title></rect>
+<text x="497.9" y="296" class="v">1.35x</text>
+<text x="12" y="340" class="n">Speed of the quintrit kernel divided by the speed of the fastest BitNet kernel; Falcon3-10B decode-step GEMVs.</text>
+</svg>

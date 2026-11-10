@@ -1,0 +1,17 @@
+# Cargo
+target/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+
+# Compiled extension placed next to the sources by `maturin develop`
+python/quintrit/*.pyd
+python/quintrit/*.so
+python/quintrit/*.dylib

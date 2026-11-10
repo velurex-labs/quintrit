@@ -1,0 +1,113 @@
+Quintrit
+Copyright 2026 Lukáš Velecký
+
+This product is licensed under the Apache License, Version 2.0 (see the file LICENSE).
+
+The notices below concern work of other authors that this software builds on, reproduces or
+interoperates with. They are provided to satisfy the notice requirements of the licenses
+concerned and to give credit.
+
+
+1. ggml and llama.cpp
+---------------------
+
+Project:   https://github.com/ggml-org/ggml and https://github.com/ggml-org/llama.cpp
+License:   MIT
+Copyright: (c) 2023-2026 The ggml authors
+
+Where this applies:
+
+  * The GGUF file layout read by quintrit-format, including the metadata value types, the
+    tensor info records, the alignment rule and the keys under "tokenizer.ggml.*", and the
+    numeric ggml tensor type ids (F32, F16, Q8_0, BF16, TQ1_0, TQ2_0, I2_S).
+  * The TQ1_0 and TQ2_0 ternary block layouts decoded by quintrit-format (block size, scale
+    placement, base-3 digit order, 2-bit element order). The conformance tests re-implement
+    the dequantizers `dequantize_row_tq1_0` and `dequantize_row_tq2_0` of ggml as references.
+  * quintrit-runtime, module `ops`: the single-precision exponential, SiLU and SwiGLU
+    vector routines follow the algorithm and polynomial coefficients of `ggml_v_expf`,
+    `ggml_v_silu` and `ggml_vec_swiglu_f32`, and the half-precision dot product,
+    multiply-add and scale routines follow `ggml_vec_dot_f16`, `ggml_vec_mad_f16` and
+    `ggml_vec_scale_f16`, so that results are bit-identical to ggml.
+  * quintrit-runtime, module `attention`: the online-softmax attention with a half-precision
+    accumulator follows `ggml_compute_forward_flash_attn_ext_f16_one_chunk`, and the rotary
+    position embedding cache follows `ggml_rope_cache_init`.
+  * quintrit-runtime, module `config`: the choice of the beginning-of-sequence token follows
+    the vocabulary loader of llama.cpp.
+
+The MIT permission notice that applies to this material:
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+
+2. BitNet (bitnet.cpp) and BitNet b1.58
+---------------------------------------
+
+Project:   https://github.com/microsoft/BitNet
+License:   MIT
+Copyright: (c) Microsoft Corporation.
+
+Where this applies:
+
+  * The I2_S ternary weight format (two bits per trit, four trits per byte, 128-weight
+    blocks, one per-tensor scale) read by quintrit-format. The packer and unpacker for this
+    layout (`pack_gguf_i2_s` and `unpack_gguf_i2_s`) reproduce the data layout of the
+    reference kernels of bitnet.cpp.
+  * The BitNet b1.58 transformer architecture implemented by quintrit-runtime (sub-layer
+    normalization, squared ReLU feed-forward, tied embeddings) and the post-scaling
+    convention of the integer matrix-vector product, which are implemented to give results
+    identical to the reference runtime. The activation quantization to int8 follows the
+    reference runtime.
+
+  * The crate quintrit-bitnet: a Rust transcription of the 4-trit kernels of bitnet.cpp (the
+    planar multiply-add kernels of `ggml-bitnet-mad.cpp`, the 32-row tiled lookup kernel and
+    their data layouts), with a widening of the multiply-add kernel to AVX-512. It is a
+    comparison baseline, is not published to crates.io and is not part of the C library or the
+    Python package.
+
+The MIT permission notice that applies to this material is the one reproduced in section 1,
+with the copyright line above.
+
+
+3. Other prior work credited for interoperability
+-------------------------------------------------
+
+  * The text-generation models whose weights this software can load (for example
+    BitNet b1.58 2B4T and Falcon3) are products of their publishers and are distributed under
+    their own licenses. No model weights are part of this software.
+  * Packing five ternary digits into one byte as a base-3 fraction is also used by the TQ1_0
+    format of ggml (section 1). The velurex encoding used by Quintrit, with the digit
+    weights 1, 3, 9, 28 and 84 and the tiled layout of the kernels, is a different encoding.
+  * The test helpers use the byte-to-unicode mapping of the byte-level BPE vocabulary
+    introduced with GPT-2 (OpenAI, MIT license) to synthesize test vocabularies.
+
+The names BitNet, Microsoft, Falcon, LLaMA, Hugging Face, GGUF and GGML are used only to
+identify the formats and models this software is compatible with. Quintrit is not affiliated
+with, endorsed by or sponsored by their owners.
+
+
+4. Third-party software libraries
+---------------------------------
+
+Quintrit depends on open-source Rust crates, among them `tokenizers` (Hugging Face), `rayon`,
+`serde`, `serde_json`, `ahash` and, for the Python bindings, `pyo3` and `numpy`. They are
+not part of this repository; each is used under its own license (MIT, Apache-2.0 or a
+combination of permissive licenses). Binary distributions (Python wheels,
+shared and static libraries) contain the compiled code of these crates; their license texts
+can be listed with `cargo about` or `cargo license` from the locked dependency set
+(`Cargo.lock`).

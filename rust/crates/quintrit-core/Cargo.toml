@@ -1,0 +1,22 @@
+[package]
+name = "quintrit-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "High-performance 1.60 bpw ternary quantization microkernel using velurex encoding and SIMD GEMV"
+
+[dependencies]
+rayon = "1.10"
+
+[[bench]]
+name = "memory_bandwidth"
+harness = false
+
+[[bench]]
+name = "table_build"
+harness = false

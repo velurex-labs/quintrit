@@ -1,0 +1,36 @@
+# Standalone package: it is excluded from the SDK workspace (see `exclude` in ../../Cargo.toml) so that a plain
+# `cargo test` of the SDK never needs a Python interpreter. Build it with `maturin` (see README.md).
+[package]
+name = "quintrit-py"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/velurex-labs/quintrit"
+readme = "README.md"
+description = "Python bindings (PyO3 + maturin) for the Quintrit 1.60 bpw ternary SDK"
+publish = false
+
+[lib]
+# The compiled extension module is `quintrit._native`.
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+quintrit-core = { path = "../quintrit-core" }
+quintrit-format = { path = "../quintrit-format" }
+quintrit-runtime = { path = "../quintrit-runtime" }
+pyo3 = { version = "0.30", features = ["abi3-py39"] }
+numpy = "0.30"
+
+# Own workspace root: keeps this package (and its Cargo.lock / target directory) out of the SDK workspace.
+[workspace]
+
+# Same optimisation settings as the SDK workspace. The one deliberate difference is `panic = "unwind"`: an extension
+# module must be able to turn a Rust panic into a Python exception (and `catch_unwind` the few paths that assert)
+# instead of aborting the interpreter process.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"

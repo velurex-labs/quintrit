@@ -1,0 +1,16 @@
+# Standalone package (its own workspace) so that `cargo test` of the SDK never builds the examples.
+#
+#   cargo run --release --bin gemv
+#   cargo run --release --bin generate -- path/to/model.gguf
+[package]
+name = "quintrit-examples"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace]
+
+[dependencies]
+quintrit-core = { path = "../../rust/crates/quintrit-core" }
+quintrit-runtime = { path = "../../rust/crates/quintrit-runtime" }

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quintrit-core",
+    "crates/quintrit-format",
+    "crates/quintrit-bitnet",
+    "crates/quintrit-runtime",
+    "crates/quintrit-c",
+]
+exclude = ["crates/quintrit-py"]
+default-members = [
+    "crates/quintrit-core",
+    "crates/quintrit-format",
+    "crates/quintrit-bitnet",
+    "crates/quintrit-runtime",
+    "crates/quintrit-c",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# The NEON dot-product intrinsics (`vdotq_s32`) are stable from Rust 1.98.
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/velurex-labs/quintrit"
+keywords = ["ternary", "quantization", "llm", "simd", "quintrit"]
+categories = ["algorithms", "hardware-support"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Same as `release`, but panics unwind. Use it for the C library (`cargo build --profile release-unwind -p quintrit-c`)
+# when the host application must survive an internal panic: with `panic = "abort"` the `catch_unwind` guards of the
+# C API cannot convert a panic into an error code, and the process aborts instead.
+[profile.release-unwind]
+inherits = "release"
+panic = "unwind"
