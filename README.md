@@ -76,6 +76,7 @@ Full documentation and guides are available in [`docs/`](docs/):
 | Document | Description |
 |---|---|
 | [`docs/velurex-encoding.md`](docs/velurex-encoding.md) | Mathematical definition, radix structure, and division-free SIMD decoding |
+| [`docs/simd-decode.md`](docs/simd-decode.md) | Per-ISA weight decode (AVX2, AVX-512, NEON): instruction sequences and bit tricks |
 | [`docs/architecture.md`](docs/architecture.md) | System architecture, crate layout, tile formats, and memory pipeline |
 | [`docs/kernels.md`](docs/kernels.md) | Kernel implementations, exact arithmetic, and supported instruction sets |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmarking methodology, memory ceiling analysis, and hardware reports |
@@ -101,6 +102,7 @@ Planned milestones and future developments:
 - **Official Distribution:** Publish packages on [crates.io](https://crates.io) and [PyPI](https://pypi.org) with pre-built binary wheels for Linux, Windows, and macOS.
 - **Pre-Tiled Native Format & Direct `mmap`:** Introduce a dedicated file format / GGUF tensor type extension with pre-tiled velurex weights, enabling direct zero-copy memory mapping (`mmap`) straight from disk without startup transcoding or RAM allocation.
 - **Hardware Acceleration:** Dedicated GPU compute backends, beginning with NVIDIA CUDA.
+- **RISC-V Support:** Native kernels for RISC-V processors implementing the RVA23 profile, built on the mandatory RISC-V Vector Extension (RVV 1.0).
 - **Extended Benchmarks:** Full-model end-to-end decoding across additional CPU microarchitectures, including Apple processors (Apple Silicon M-series), alongside dedicated performance benchmarks for long context sequences.
 - **Edge Efficiency:** Telemetry-backed energy consumption profiling (Joules per decoded token) across edge platforms.
 - **Hardware-Level Implementation (FPGA & ASIC):** Explore dedicated digital architecture and hardware-level implementation possibilities (FPGA prototyping and ASIC designs) leveraging division-free velurex decoding for custom ternary accelerator cores.

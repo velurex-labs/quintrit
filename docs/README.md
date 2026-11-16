@@ -3,6 +3,7 @@
 | Document | Content |
 |---|---|
 | [`velurex-encoding.md`](velurex-encoding.md) | The encoding: definition, why the radix 28 allows a division-free decoder, comparison with other ternary formats, citation |
+| [`simd-decode.md`](simd-decode.md) | How AVX2, AVX-512 and NEON decode a weight byte into table indices: instruction sequences, data-flow diagrams and the bit tricks behind them |
 | [`architecture.md`](architecture.md) | The crates, the path from a GGUF file to the first token, the tile layout |
 | [`kernels.md`](kernels.md) | The kernels, their exactness and the instruction sets |
 | [`benchmarks.md`](benchmarks.md) | Kernel comparison with BitNet on four machines, the memory ceilings, how to run the benchmarks |

@@ -75,8 +75,14 @@ U   = v17 >> 2                              // Final quotient: floor(B / 28)
 > The expression `(v11 + v15 + 1) >> 1` corresponds directly to native single-cycle hardware instructions present in all major SIMD architectures:
 > - **x86-64 (AVX2 / AVX-512):** `_mm256_avg_epu8` (`vpavgb`)
 > - **AArch64 (ARM NEON):** `vrhadd_u8` / `vrhaddq_u8`
->
-> On AVX-512 with VBMI, decoding is even faster: since $28$ is a multiple of $4$, $\lfloor B / 28 \rfloor = \lfloor (B \gg 2) / 7 \rfloor$. The quotient and table offsets are resolved in just 4 uops using vector byte permutations (`vpermb`).
+
+The sequence above is the common principle. Each instruction set implements it differently, because the building blocks it offers differ (per-byte shifts, the size of the byte table lookup, a byte multiply-subtract):
+
+- **AVX2** has no per-byte shift and only a 16-entry `vpshufb`. Every shift is followed by a mask, the lower trits $(d_0, d_1)$ are indexed through a hash that makes $U$ vanish modulo 16, and $d_2$ is obtained from an interval test and applied with `vpsignb`, without any table (17 instructions for 32 rows).
+- **ARM NEON** shifts bytes natively (`USHR`), computes the exact remainder $L = B - 28U$ with one `MLS` and looks up all 27 values of $L$ with a two-register `TBL` (5 instructions for 16 rows).
+- **AVX-512 with VBMI** skips the shift-and-average approximation entirely: since $28$ is a multiple of $4$, $\lfloor B / 28 \rfloor = \lfloor (B \gg 2) / 7 \rfloor$, and $B \gg 2$ is a 6-bit index into a 64-entry `vpermb` table. One unmasked shift, two `vpermb` and one subtraction yield both indices (4 instructions for 64 rows).
+
+The instruction sequences, data-flow diagrams and the reasoning behind each bit trick are described in [`simd-decode.md`](simd-decode.md).
 
 Exhaustive testing across all $0 \le B \le 250$ verifies that this sequence reproduces $\lfloor B / 28 \rfloor$ with **100% bit-exact accuracy**. The decoder requires **zero hardware integer division and zero modulo instructions**.
 
