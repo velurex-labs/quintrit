@@ -58,6 +58,12 @@ If standard base-3 powers $(1, 3, 9, 27, 81)$ were used, separating the groups w
 - Integer division and modulo by 27 do not exist in SIMD instruction sets (AVX2, AVX-512, ARM NEON).
 - Emulating division by 27 across vector lanes requires multi-instruction multiplication with large magic constants and wide bit shifts, introducing register pressure and pipeline latency.
 
+llama.cpp's `TQ1_0` avoids the division in a different way. It stores the five digits as a base-3 fixed-point fraction, $q = \lceil 256 \cdot v / 243 \rceil$ with $v = 81\,d_0 + 27\,d_1 + 9\,d_2 + 3\,d_3 + d_4$ (first weight most significant), and extracts weight $n$ as
+
+$$d_n = \left\lfloor \frac{3 \cdot (3^n q \bmod 256)}{256} \right\rfloor$$
+
+that is, a byte multiplication by $3^n$ (wrapping modulo 256), a multiplication by 3 and a shift by 8 bits (`dequantize_row_tq1_0`; its AVX2 kernel builds the multiplications from shifts and additions and the final step from two `vpavgb` and a shift). This needs no division either, but it extracts the five weights one by one. Velurex encoding splits the byte at once into a group of three digits and a group of two, and both groups are used directly as table indices.
+
 By choosing **28 instead of 27**, we exploit the factorization:
 
 $$28 = 4 \times 7$$
@@ -135,13 +141,15 @@ Both parts share the identical decoded weight indices, and partial products are 
 |:---|:---:|:---:|:---:|:---|:---|
 | **Microsoft `I2_S`** *(BitNet)* | 4 | 2.00 bpw | Baseline (0.0%) | 1 per tensor | Bit-slicing / planar MAD |
 | **`TQ2_0`** *(GGUF type 35)* | 4 | 2.0625 bpw | $-3.1\%$ (larger) | Block scale (66B / 256w) | 2-bit lookup |
-| **`TQ1_0`** *(GGUF type 34)* | 5 | 1.6875 bpw | $+15.6\%$ | Block scale (54B / 256w) | Base-3 division / unpack |
+| **`TQ1_0`** *(GGUF type 34)* | 5 | 1.6875 bpw | $+15.6\%$ | Block scale (54B / 256w) | Per weight: byte multiply by $3^n$, multiply by 3, shift |
+| **Microsoft TL2** *(BitNet, x86)* | 3 per 5 bits | ≈1.67 bpw | $\approx +16.7\%$ | 1 per tensor | 4-bit table index + sign bit per 3 weights |
 | **Velurex Encoding** *(Quintrit)* | **5** | **1.60 bpw** | **$+20.0\%$** | 1 per tensor | **Division-free SIMD ALU / LUT** |
 | *Shannon Entropy Limit* | — | 1.585 bpw | $+20.7\%$ | — | Theoretical bound ($\log_2 3$) |
 
 ### Key Takeaways:
 - **Exact 20.0% Bandwidth Reduction:** Compared to `I2_S`, weight streaming traffic drops from 250 MB to 200 MB per billion parameters per token.
-- **5.2% Denser than `TQ1_0`:** Avoids the per-block scale overhead and base-3 decoding penalties of `TQ1_0`.
+- **5.2% Denser than `TQ1_0`:** Avoids the per-block scale overhead of `TQ1_0` and its weight-by-weight extraction (multiply and shift per weight).
+- **Denser than TL2:** BitNet's TL2 stores three weights in 5 bits: the magnitude of $9t_0 + 3t_1 + t_2$ as a 4-bit index into a 14-entry activation table plus a separate sign bit. The tail of each row that is not a multiple of the three-weight blocks falls back to TL1 (two weights in 4 bits), so the effective density lies slightly above 1.67 bpw (about 1.69 bpw for 3072 columns, against 1.60 bpw).
 - **Hardware-Native:** Directly matches the 32-row and 64-row SIMD execution widths on modern server and edge processors. For empirical bandwidth measurements, see [`benchmarks.md`](benchmarks.md).
 
 ---

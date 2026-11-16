@@ -103,8 +103,9 @@ decides depends on how close the BitNet kernel already is to the memory ceiling 
 
 These are kernel rates. A whole generated token also runs the F16 output projection, which is the same for both
 encodings and takes 13-30 % of a token, plus attention and normalization. Ratios per token therefore lie closer to 1
-than the kernel ratios. The BitNet kernels are not part of the inference engine of this SDK, so this page gives
-no token-level comparison.
+than the kernel ratios. The BitNet kernels are not part of the default inference engine of this SDK; with the cargo
+feature `bitnet-baseline` the end-to-end benchmarks run them on a whole model (see [Running the benchmarks](#running-the-benchmarks)).
+A token-level comparison will be added to this page once it has been measured on every machine.
 
 ## Memory ceiling
 

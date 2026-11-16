@@ -36,9 +36,9 @@ $$3^5 = 243 \le 256$$
 - **25% higher theoretical throughput ceiling:** Because memory bandwidth dictates decoding speed, streaming 20% less data allows up to 25% higher token generation rates under memory-bound conditions.
 
 ### Division-Free SIMD Decoding
-Packing five ternary weights into a byte is traditionally done using standard base-3 powers $(1, 3, 9, 27, 81)$. However, decoding such a representation requires integer division and modulo arithmetic—operations that do not exist natively on SIMD vector lanes and severely bottleneck execution pipelines.
+Packing five ternary weights into a byte is traditionally done using standard base-3 powers $(1, 3, 9, 27, 81)$. Read as a plain integer, such a byte needs integer division and modulo arithmetic to separate the digits, and SIMD vector lanes have neither. llama.cpp's `TQ1_0` therefore stores the byte as a base-3 fixed-point fraction and extracts every weight on its own, with a byte multiplication by a power of 3, a multiplication by 3 and a shift.
 
-Velurex encoding departs from the traditional $(1, 3, 9, 27, 81)$ scheme. By employing an algebraic radix structure specifically engineered for vector hardware, it completely eliminates integer division and remainder operations. Weights decode across vector lanes using only fast bitwise shifts, byte averages (`vpavgb`, `vrhadd`), or vector shuffles (`vpermb`), indexing directly into fused Look-Up Table (LUT) kernels that evaluate integer dot products against `int8` activations with zero rounding error.
+Velurex encoding departs from the traditional $(1, 3, 9, 27, 81)$ scheme. By employing an algebraic radix structure specifically engineered for vector hardware, it eliminates integer division and remainder operations and splits each byte at once into two digit groups (two and three weights). Weights decode across vector lanes using only fast bitwise shifts, byte averages (`vpavgb`, `vrhadd`), or vector shuffles (`vpermb`), and the two groups index directly into fused Look-Up Table (LUT) kernels that evaluate integer dot products against `int8` activations with zero rounding error.
 
 The complete mathematical definition and derivation are documented in [`docs/velurex-encoding.md`](docs/velurex-encoding.md).
 
@@ -55,17 +55,18 @@ The complete mathematical definition and derivation are documented in [`docs/vel
 
 ## Benchmarks
 
-Token generation throughput is measured against official BitNet reference kernels (`mad` on AVX2/NEON and `mad512` on AVX-512) under identical system conditions, verifying 100% token-for-token output parity under greedy decoding (`temperature = 0`).
+The quintrit kernels are compared with faithful Rust transcriptions of Microsoft BitNet's kernels (`mad` on AVX2 and NEON, its AVX-512 widening `mad512`) in the same harness, on the same machines, over the weight-streaming pattern of one Falcon3-10B decode step. Before every measurement, the runtime's 256 greedy tokens and checked logits were bit-identical to the BitNet reference runtime.
 
-### Selected Performance Excerpt (Falcon3-10B-Instruct-1.58bit)
+### Excerpt: GEMV kernel throughput (Falcon3-10B shapes, weights from DRAM)
 
-| Platform | Instruction Set | Threads | BitNet Baseline | Quintrit | Speedup |
+| Machine | Instruction set | Threads | BitNet kernel | Quintrit kernel | Relative speed |
 |---|---|---:|---:|---:|---:|
-| **AMD EPYC 9V45** (Zen 4) | AVX-512 | 4 | 12.34 tok/s | **14.95 tok/s** | **1.21×** |
-| **Raspberry Pi 5** (Cortex-A76) | NEON | 4 | 3.14 tok/s (318 ms) | **3.64 tok/s (275 ms)** | **1.16×** |
+| AMD EPYC 9V45 | AVX-512 (vs. `mad512`) | 4 | 164.2 Gweights/s | **221.6 Gweights/s** | **1.35×** |
+| Intel Core i7-7700 | AVX2 | 4 | 97.9 Gweights/s | **146.9 Gweights/s** | **1.50×** |
+| Raspberry Pi 5 | NEON | 4 | 40.7 Gweights/s | **55.1 Gweights/s** | **1.35×** |
+| Raspberry Pi 5 | NEON | 1 | 24.5 Gweights/s | 17.3 Gweights/s | 0.71× |
 
-> [!NOTE]
-> End-to-end autoregressive token generation rates are measured under greedy decoding (`temperature = 0`) with 100% token-for-token bit-exact parity against the reference runtime. For standalone GEMV kernel throughput, memory-bandwidth ceiling analyses, and reproduction instructions, see [`docs/benchmarks.md`](docs/benchmarks.md).
+The 5-trit kernels win where the BitNet kernel is close to the memory ceiling of the machine and lose where one core is compute-bound. These are kernel rates; a whole token also runs the F16 output projection and attention, which are the same for both encodings, so the gain per token is smaller. The full table, the method and the memory ceilings are in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ---
 

@@ -2,8 +2,11 @@
 //!
 //! # Storage Architecture (`block_tq1_0`)
 //! - Block size: 256 weights in 54 bytes.
-//! - `qs[48]`: 48 bytes encoding 240 weights using standard Base-3 ($B = t_0 + 3t_1 + 9t_2 + 27t_3 + 81t_4$).
-//! - `qh[4]`: 4 bytes encoding 16 leftover weights packed at 2 bits each.
+//! - `qs[48]`: 48 bytes encoding 240 weights, five per byte, as a base-3 fixed-point fraction
+//!   $q = \lceil 256 v / 243 \rceil$ with $v = 81 d_0 + 27 d_1 + 9 d_2 + 3 d_3 + d_4$ and $d_k = t_k + 1$
+//!   (first weight most significant).
+//! - `qh[4]`: 4 bytes encoding the remaining 16 weights, four per byte, in the same way (the fifth digit is zero).
+//! - Decoding needs no division: $d_n = \lfloor 3 (3^n q \bmod 256) / 256 \rfloor$.
 //! - `d`: 2-byte FP16 per-block scale factor.
 
 use super::TernaryDecoder;
