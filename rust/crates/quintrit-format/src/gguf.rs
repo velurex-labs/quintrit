@@ -18,13 +18,15 @@
 //! - `general.alignment` must be an unsigned integer and a power of two;
 //! - a tensor has 1 to 8 dimensions, at most 2^40 elements, an offset that is a multiple of the alignment and that
 //!   lies inside the data section; for the types whose size is known (`F32`, `F16`, `BF16`, `Q8_0`, `I2_S`, `TQ1_0`,
-//!   `TQ2_0`) the whole payload must lie inside the file, and the payloads of different tensors must not overlap.
+//!   `TQ2_0`, `Q2_0`) the whole payload must lie inside the file, and the payloads of different tensors must not
+//!   overlap. The block size of `Q2_0` tensors (64 or 128 weights) is read from the layout.
 //!
 //! The parser is still not a substitute for trusting the source of a model: a valid file can describe a model that is
 //! larger than your memory.
 
 use memmap2::Mmap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::mem::size_of;
@@ -54,6 +56,10 @@ pub const GGML_TYPE_TQ1_0: u32 = 34;
 pub const GGML_TYPE_TQ2_0: u32 = 35;
 /// Microsoft BitNet 2.00 bpw (4 trits per byte) planar block-interleaved format.
 pub const GGML_TYPE_I2_S: u32 = 36;
+/// llama.cpp Q2_0: 2-bit codes (`code - 1` in `{-1, 0, +1, +2}`, four per byte) with one f16 scale per block of 64
+/// weights (18 bytes). Some files (the first Ternary Bonsai generation) use blocks of 128 weights (34 bytes) under the
+/// same type number; [`GgufTensorInfo::block_size`] tells which one a tensor uses.
+pub const GGML_TYPE_Q2_0: u32 = 42;
 
 /// Metadata value stored in a GGUF header.
 #[derive(Debug, Clone)]
@@ -137,6 +143,9 @@ pub struct GgufTensorInfo {
     pub shape: Vec<usize>,
     pub tensor_type: u32,
     pub offset: u64,
+    /// Weights per block for `Q2_0` tensors (64, or 128 for files written with the older block size); `None` for every
+    /// other type. Determined from the tensor layout when the file is opened.
+    pub block_size: Option<usize>,
 }
 
 impl GgufTensorInfo {
@@ -158,6 +167,10 @@ impl GgufTensorInfo {
             GGML_TYPE_I2_S => Some(n.div_ceil(4)),
             GGML_TYPE_TQ1_0 if n.is_multiple_of(256) => (n / 256).checked_mul(54),
             GGML_TYPE_TQ2_0 if n.is_multiple_of(256) => (n / 256).checked_mul(66),
+            GGML_TYPE_Q2_0 => match self.block_size {
+                Some(bs) if n.is_multiple_of(bs) => (n / bs).checked_mul(2 + bs / 4),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -170,6 +183,8 @@ pub struct GgufFile {
     pub metadata: HashMap<String, GgufMetadataValue>,
     pub tensors: HashMap<String, GgufTensorInfo>,
     data_start: usize,
+    /// Names of the tensors whose data has been requested, so that a loader can tell which tensors it did not use.
+    read_log: Mutex<HashSet<String>>,
 }
 
 impl GgufFile {
@@ -230,7 +245,7 @@ impl GgufFile {
             }
             let tensor_type = r.u32("tensor type")?;
             let offset = r.u64("tensor offset")?;
-            infos.push(GgufTensorInfo { name, shape, tensor_type, offset });
+            infos.push(GgufTensorInfo { name, shape, tensor_type, offset, block_size: None });
         }
 
         let alignment = match metadata.get("general.alignment") {
@@ -249,6 +264,7 @@ impl GgufFile {
             .filter(|&d| d <= file_len)
             .ok_or_else(|| invalid(format!("the tensor data section would start beyond the end of the file ({file_len} bytes)")))?;
         let data_len = file_len - data_start;
+        detect_q2_0_block_size(&mut infos, data_len, alignment)?;
 
         // (start, end, name) of every payload whose size is known, for the overlap check.
         let mut ranges: Vec<(usize, usize, &str)> = Vec::new();
@@ -293,16 +309,27 @@ impl GgufFile {
             metadata,
             tensors,
             data_start,
+            read_log: Mutex::new(HashSet::new()),
         })
     }
 
-    /// Returns a slice to the raw bytes of a tensor, or `None` for an unknown tensor, a type this reader cannot
-    /// serve (`Q8_0`, `BF16` and the unknown types) or a payload that does not lie inside the file.
+    /// Returns a slice to the raw bytes of a tensor, or `None` for an unknown tensor, a type whose layout this reader
+    /// does not know or a payload that does not lie inside the file.
     pub fn get_tensor_data(&self, name: &str) -> Option<&[u8]> {
         let tensor = self.tensors.get(name)?;
+        if let Ok(mut log) = self.read_log.lock() {
+            log.insert(name.to_string());
+        }
         if !matches!(
             tensor.tensor_type,
-            GGML_TYPE_F32 | GGML_TYPE_F16 | GGML_TYPE_I2_S | GGML_TYPE_TQ1_0 | GGML_TYPE_TQ2_0
+            GGML_TYPE_F32
+                | GGML_TYPE_F16
+                | GGML_TYPE_BF16
+                | GGML_TYPE_Q8_0
+                | GGML_TYPE_I2_S
+                | GGML_TYPE_TQ1_0
+                | GGML_TYPE_TQ2_0
+                | GGML_TYPE_Q2_0
         ) {
             return None;
         }
@@ -354,6 +381,16 @@ impl GgufFile {
         // SAFETY: every bit pattern is a valid u16; `align_to` only yields the correctly aligned middle part.
         let (head, mid, tail) = unsafe { bytes.align_to::<u16>() };
         (head.is_empty() && tail.is_empty()).then_some(mid)
+    }
+
+    /// Names of the tensors whose data has never been requested through [`GgufFile::get_tensor_data`] (or the typed
+    /// accessors built on it), sorted. A loader calls this after loading to make sure that no tensor of the file was
+    /// silently ignored.
+    pub fn unread_tensors(&self) -> Vec<String> {
+        let log = self.read_log.lock().map(|l| l.clone()).unwrap_or_default();
+        let mut v: Vec<String> = self.tensors.keys().filter(|n| !log.contains(*n)).cloned().collect();
+        v.sort();
+        v
     }
 
     /// Returns the architecture name (e.g., "bitnet", "falcon3", "llama").
@@ -419,6 +456,58 @@ impl GgufFile {
     pub fn data_start(&self) -> usize {
         self.data_start
     }
+}
+
+/// Sets [`GgufTensorInfo::block_size`] of every `Q2_0` tensor. GGUF has no field for it, so it is read from the
+/// layout: the payload of a tensor ends at most `alignment - 1` bytes before the next tensor (or the end of the data
+/// section), which singles out one of the candidate block sizes 64 and 128 for any tensor of realistic size. A small
+/// tensor that fits both takes the size of the others; if no tensor decides, llama.cpp's 64 is used. All `Q2_0`
+/// tensors must agree.
+fn detect_q2_0_block_size(infos: &mut [GgufTensorInfo], data_len: usize, alignment: usize) -> IoResult<()> {
+    if !infos.iter().any(|t| t.tensor_type == GGML_TYPE_Q2_0) {
+        return Ok(());
+    }
+    let mut starts: Vec<u64> = infos.iter().map(|t| t.offset).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let mut candidates = Vec::new();
+    for (i, info) in infos.iter().enumerate().filter(|(_, t)| t.tensor_type == GGML_TYPE_Q2_0) {
+        let n = info.num_elements();
+        let next = starts.iter().copied().find(|&o| o > info.offset).map(|o| o as usize).unwrap_or(data_len);
+        let room = next.saturating_sub(info.offset as usize);
+        let fits = |bs: usize| {
+            n.is_multiple_of(bs)
+                && (n / bs)
+                    .checked_mul(2 + bs / 4)
+                    .is_some_and(|len| len <= room && (next == data_len || room - len < alignment.max(1)))
+        };
+        let c = match (fits(64), fits(128)) {
+            (true, false) => Some(64),
+            (false, true) => Some(128),
+            (true, true) => None,
+            (false, false) => {
+                return Err(invalid(format!(
+                    "Q2_0 tensor '{}' ({n} elements, {room} bytes) matches neither 64- nor 128-weight blocks",
+                    info.name
+                )))
+            }
+        };
+        candidates.push((i, c));
+    }
+    let mut decided: Option<usize> = None;
+    for &(i, c) in &candidates {
+        if let Some(bs) = c {
+            if decided.is_some_and(|d| d != bs) {
+                return Err(invalid(format!("Q2_0 tensors with different block sizes ('{}' uses {bs})", infos[i].name)));
+            }
+            decided = Some(bs);
+        }
+    }
+    let bs = decided.unwrap_or(64);
+    for (i, _) in candidates {
+        infos[i].block_size = Some(bs);
+    }
+    Ok(())
 }
 
 fn invalid(msg: String) -> Error {

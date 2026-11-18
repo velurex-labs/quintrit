@@ -16,6 +16,20 @@ scalar kernel is slow and exists as a reference and as a fallback for other arch
 A buffer packed for a 32-row kernel can be read by every 32-row kernel; the AVX-512 kernel needs its own 64-row layout.
 When you store packed weights, store the resolved kernel, not `auto`.
 
+## Block-scaled kernel (`Q2_0`)
+
+Models stored with llama.cpp's `Q2_0` type (one scale per 64 weights) do not go through the kernels above, because a
+table kernel with one scale per tensor cannot apply per-block scales. The loader chooses the block-scaled kernel
+(`quintrit_core::block_scaled`) for these tensors: the weights are kept in velurex encoding plus one `f32` scale per
+64 weights, the activations are quantized in blocks of 32 (`Q8_0`), and the result reproduces llama.cpp's
+`ggml_vec_dot_q2_0_q8_0` bit for bit. It has an AVX-512 path (VL, VBMI and VNNI: the weights are decoded with byte
+permutes and the products formed with `vpdpbusd`; a 512-bit register holds both of ggml's accumulator chains, so it
+takes two activation blocks per step without changing the order of any sum), an AVX2 path, a NEON path (AArch64 with
+the dot product) and a portable path, which all give the same bits. The other numerical routines these models need
+(F32, BF16 and `Q8_0` dot products, the F16 x F32 attention dot product and value accumulation) have AVX-512 and NEON
+paths with the same property, and the `Q8_0` quantization of the activations and the Walsh-Hadamard transform have
+AVX-512 paths.
+
 ## Exactness
 
 The kernels compute the exact integer product `Σ w·x` of ternary weights and `int8` activations. They do not round
@@ -53,7 +67,8 @@ the same across instruction sets (see below).
 With temperature 0 (greedy decoding), the generated text and the logits are identical for every kernel on the same
 operating system. The runtime reproduces the arithmetic of the reference runtimes it was checked against, including
 their fused multiply-adds; results can differ between platforms whose math library rounds `expf`, `cosf`, `sinf` or
-`powf` differently in the last bit, because a transformer amplifies such a difference after a few dozen tokens.
+`powf` differently in the last bit, because a transformer amplifies such a difference after a few dozen tokens. Outside Windows the runtime
+evaluates `log1pf` with its own copy of the x86-64 glibc routine, so x86-64 and AArch64 Linux agree.
 
 ## Requirements
 

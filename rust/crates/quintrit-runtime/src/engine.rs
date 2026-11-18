@@ -67,6 +67,24 @@ pub fn format_chat_prompt(messages: &[ChatMessage], arch: ModelArchitecture) -> 
             prompt.push_str("<|assistant|>\n");
             prompt
         }
+        ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 | ModelArchitecture::NemotronHMoe => {
+            // ChatML, as in the chat template of the Qwen models; thinking is switched off with an empty block.
+            let mut prompt = String::new();
+            for msg in messages {
+                let role = match msg.role.trim().to_lowercase().as_str() {
+                    "system" => "system",
+                    "assistant" => "assistant",
+                    _ => "user",
+                };
+                prompt.push_str("<|im_start|>");
+                prompt.push_str(role);
+                prompt.push('\n');
+                prompt.push_str(&msg.content);
+                prompt.push_str("<|im_end|>\n");
+            }
+            prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+            prompt
+        }
         ModelArchitecture::BitNet | ModelArchitecture::Llama => {
             let mut prompt = String::new();
             for msg in messages {
@@ -232,164 +250,151 @@ impl InferenceEngine {
             _ => None,
         };
 
-        let tokenizer = QuintritTokenizer::from_gguf_metadata_with_types(
+        let tokenizer = QuintritTokenizer::from_gguf_metadata_with_pre(
             &tokens,
             merges.as_deref(),
             token_types.as_deref(),
+            gguf.metadata.get("tokenizer.ggml.pre").and_then(|v| v.as_str()),
             config.bos_token_id,
             config.eos_token_id,
         )?;
 
-        // 3. Load Token Embeddings
-        progress!("==> Loading token embeddings (F16)...");
-        let embd_f16 = gguf
-            .get_tensor_f16("token_embd.weight")
-            .ok_or_else(|| "Missing token_embd.weight tensor".to_string())?;
-        let token_embeddings = embd_f16.to_vec();
-
-        // 4. Load Output RMSNorm
-        progress!("==> Loading output RMSNorm...");
-        let output_norm = gguf
-            .get_tensor_f32("output_norm.weight")
-            .ok_or_else(|| "Missing output_norm.weight tensor".to_string())?;
-
-        // 5. Load and Transcode Transformer Blocks into host RAM
-        progress!(
-            "==> Loading & Transcoding {} decoder layers into RAM (Kernel: {:?}, Threads: {})...",
-            config.num_hidden_layers, target_kernel, num_threads
-        );
-        let mut blocks = Vec::with_capacity(config.num_hidden_layers);
-
-        for l in 0..config.num_hidden_layers {
-            let attn_norm = gguf
-                .get_tensor_f32(&format!("blk.{}.attn_norm.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.attn_norm.weight", l))?;
-
-            let ffn_norm = gguf
-                .get_tensor_f32(&format!("blk.{}.ffn_norm.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.ffn_norm.weight", l))?;
-
-            let attn_sub_norm = if config.has_sub_norm {
-                gguf.get_tensor_f32(&format!("blk.{}.attn_sub_norm.weight", l))
+        let (model, kv_cache) = if matches!(config.architecture, ModelArchitecture::Qwen35 | ModelArchitecture::NemotronHMoe) {
+            progress!("==> Loading hybrid layers ({:?})...", config.architecture);
+            let output_norm = gguf
+                .get_tensor_f32("output_norm.weight")
+                .ok_or_else(|| "Missing output_norm.weight tensor".to_string())?;
+            let (hybrid, kv) = if config.architecture == ModelArchitecture::Qwen35 {
+                crate::hybrid::load_qwen35(gguf, &config, num_threads)?
             } else {
-                None
+                crate::hybrid::load_nemotron_h_moe(gguf, &config, num_threads)?
+            };
+            let model = QuintritModel {
+                config: config.clone(),
+                token_embeddings: Vec::new(),
+                blocks: Vec::new(),
+                output_norm,
+                lm_head: None,
+                lm_head_f16: None,
+                embedding_layer: None,
+                hybrid: Some(hybrid),
+            };
+            (model, kv)
+        } else {
+            // 3. Load Token Embeddings (F16, or Q2_0 as a block-scaled layer whose rows are dequantized per token)
+            progress!("==> Loading token embeddings...");
+            let (token_embeddings, embedding_layer) = match gguf.tensors.get("token_embd.weight").map(|t| t.tensor_type) {
+                Some(quintrit_format::GGML_TYPE_Q2_0) => (
+                    Vec::new(),
+                    Some(load_projection(gguf, "token_embd.weight", config.vocab_size, config.hidden_size, target_kernel, num_threads)?),
+                ),
+                _ => (
+                    gguf.get_tensor_f16("token_embd.weight")
+                        .ok_or_else(|| "Missing token_embd.weight tensor".to_string())?
+                        .to_vec(),
+                    None,
+                ),
             };
 
-            let ffn_sub_norm = if config.has_sub_norm {
-                gguf.get_tensor_f32(&format!("blk.{}.ffn_sub_norm.weight", l))
-            } else {
-                None
-            };
+            // 4. Load Output RMSNorm
+            progress!("==> Loading output RMSNorm...");
+            let output_norm = gguf
+                .get_tensor_f32("output_norm.weight")
+                .ok_or_else(|| "Missing output_norm.weight tensor".to_string())?;
 
-            // Attention projections
-            let q_data = gguf
-                .get_tensor_data(&format!("blk.{}.attn_q.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.attn_q.weight", l))?;
-            let k_data = gguf
-                .get_tensor_data(&format!("blk.{}.attn_k.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.attn_k.weight", l))?;
-            let v_data = gguf
-                .get_tensor_data(&format!("blk.{}.attn_v.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.attn_v.weight", l))?;
-            let o_data = gguf
-                .get_tensor_data(&format!("blk.{}.attn_output.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.attn_output.weight", l))?;
-
-            // FFN projections
-            let gate_data = gguf
-                .get_tensor_data(&format!("blk.{}.ffn_gate.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.ffn_gate.weight", l))?;
-            let up_data = gguf
-                .get_tensor_data(&format!("blk.{}.ffn_up.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.ffn_up.weight", l))?;
-            let down_data = gguf
-                .get_tensor_data(&format!("blk.{}.ffn_down.weight", l))
-                .ok_or_else(|| format!("Missing blk.{}.ffn_down.weight", l))?;
-
+            // 5. Load and Transcode Transformer Blocks into host RAM
+            progress!(
+                "==> Loading & Transcoding {} decoder layers into RAM (Kernel: {:?}, Threads: {})...",
+                config.num_hidden_layers, target_kernel, num_threads
+            );
+            let mut blocks = Vec::with_capacity(config.num_hidden_layers);
             let q_dim = config.num_attention_heads * config.head_dim;
             let kv_dim = config.num_key_value_heads * config.head_dim;
 
-            let q_name = format!("blk.{}.attn_q.weight", l);
-            let k_name = format!("blk.{}.attn_k.weight", l);
-            let v_name = format!("blk.{}.attn_v.weight", l);
-            let o_name = format!("blk.{}.attn_output.weight", l);
-            let gate_name = format!("blk.{}.ffn_gate.weight", l);
-            let up_name = format!("blk.{}.ffn_up.weight", l);
-            let down_name = format!("blk.{}.ffn_down.weight", l);
+            for l in 0..config.num_hidden_layers {
+                let norm = |name: &str| -> Result<Vec<f32>, String> {
+                    gguf.get_tensor_f32(&format!("blk.{l}.{name}.weight")).ok_or_else(|| format!("Missing blk.{l}.{name}.weight"))
+                };
+                let attn_norm = norm("attn_norm")?;
+                let ffn_norm = norm("ffn_norm")?;
+                let attn_sub_norm = if config.has_sub_norm { gguf.get_tensor_f32(&format!("blk.{l}.attn_sub_norm.weight")) } else { None };
+                let ffn_sub_norm = if config.has_sub_norm { gguf.get_tensor_f32(&format!("blk.{l}.ffn_sub_norm.weight")) } else { None };
 
-            let tensor_scale = |name: &str| -> Result<f32, String> {
-                match gguf.get_tensor_scale(name) {
-                    Some(scale) => Ok(scale),
-                    None => match gguf.tensors.get(name).map(|t| t.tensor_type) {
-                        Some(quintrit_format::GGML_TYPE_TQ1_0) | Some(quintrit_format::GGML_TYPE_TQ2_0) => Err(format!(
-                            "Tensor '{}' has differing per-block scales, which a per-tensor weight scale cannot represent",
-                            name
-                        )),
-                        _ => Ok(1.0),
-                    },
+                let proj = |name: &str, rows: usize, cols: usize| {
+                    load_projection(gguf, &format!("blk.{l}.{name}.weight"), rows, cols, target_kernel, num_threads)
+                };
+                let q_proj = proj("attn_q", q_dim, config.hidden_size)?;
+                let k_proj = proj("attn_k", kv_dim, config.hidden_size)?;
+                let v_proj = proj("attn_v", kv_dim, config.hidden_size)?;
+                let o_proj = proj("attn_output", config.hidden_size, q_dim)?;
+                let gate_proj = proj("ffn_gate", config.intermediate_size, config.hidden_size)?;
+                let up_proj = proj("ffn_up", config.intermediate_size, config.hidden_size)?;
+                let down_proj = proj("ffn_down", config.hidden_size, config.intermediate_size)?;
+
+                let mut attn_block = AttentionBlock::new(q_proj, k_proj, v_proj, o_proj, attn_sub_norm, &config);
+                if config.qk_norm {
+                    attn_block = attn_block.with_qk_norm(norm("attn_q_norm")?, norm("attn_k_norm")?);
                 }
+
+                blocks.push(TransformerBlock {
+                    attn_norm,
+                    attn: attn_block,
+                    ffn_norm,
+                    gate_proj,
+                    up_proj,
+                    ffn_sub_norm,
+                    down_proj,
+                    hidden_act: config.hidden_act,
+                    rms_norm_eps: config.rms_norm_eps,
+                    hidden_size: config.hidden_size,
+                    intermediate_size: config.intermediate_size,
+                });
+            }
+
+            // The output head: an F16 table, a Q2_0 matrix, or the token embedding (tied).
+            let (lm_head, lm_head_f16) = match gguf.tensors.get("output.weight").map(|t| t.tensor_type) {
+                Some(quintrit_format::GGML_TYPE_Q2_0) => (
+                    Some(load_projection(gguf, "output.weight", config.vocab_size, config.hidden_size, target_kernel, num_threads)?),
+                    None,
+                ),
+                Some(_) => (None, gguf.get_tensor_f16("output.weight").map(|s| s.to_vec())),
+                None => (embedding_layer.clone(), None),
             };
-            let q_scale = tensor_scale(&q_name)?;
-            let k_scale = tensor_scale(&k_name)?;
-            let v_scale = tensor_scale(&v_name)?;
-            let o_scale = tensor_scale(&o_name)?;
-            let gate_scale = tensor_scale(&gate_name)?;
-            let up_scale = tensor_scale(&up_name)?;
-            let down_scale = tensor_scale(&down_name)?;
 
-            let q_type = gguf.tensors.get(&q_name).map(|t| t.tensor_type).unwrap_or(quintrit_format::GGML_TYPE_I2_S);
-            let k_type = gguf.tensors.get(&k_name).map(|t| t.tensor_type).unwrap_or(quintrit_format::GGML_TYPE_I2_S);
-            let v_type = gguf.tensors.get(&v_name).map(|t| t.tensor_type).unwrap_or(quintrit_format::GGML_TYPE_I2_S);
-            let o_type = gguf.tensors.get(&o_name).map(|t| t.tensor_type).unwrap_or(quintrit_format::GGML_TYPE_I2_S);
-            let gate_type = gguf.tensors.get(&gate_name).map(|t| t.tensor_type).unwrap_or(quintrit_format::GGML_TYPE_I2_S);
-            let up_type = gguf.tensors.get(&up_name).map(|t| t.tensor_type).unwrap_or(quintrit_format::GGML_TYPE_I2_S);
-            let down_type = gguf.tensors.get(&down_name).map(|t| t.tensor_type).unwrap_or(quintrit_format::GGML_TYPE_I2_S);
+            let model = QuintritModel {
+                config: config.clone(),
+                token_embeddings,
+                blocks,
+                output_norm,
+                lm_head,
+                lm_head_f16,
+                embedding_layer,
+                hybrid: None,
+            };
 
-            let q_proj = dispatch_ternary_layer(q_type, q_data, q_dim, config.hidden_size, q_scale, target_kernel, num_threads)?;
-            let k_proj = dispatch_ternary_layer(k_type, k_data, kv_dim, config.hidden_size, k_scale, target_kernel, num_threads)?;
-            let v_proj = dispatch_ternary_layer(v_type, v_data, kv_dim, config.hidden_size, v_scale, target_kernel, num_threads)?;
-            let o_proj = dispatch_ternary_layer(o_type, o_data, config.hidden_size, q_dim, o_scale, target_kernel, num_threads)?;
-
-            let gate_proj = dispatch_ternary_layer(gate_type, gate_data, config.intermediate_size, config.hidden_size, gate_scale, target_kernel, num_threads)?;
-            let up_proj = dispatch_ternary_layer(up_type, up_data, config.intermediate_size, config.hidden_size, up_scale, target_kernel, num_threads)?;
-            let down_proj = dispatch_ternary_layer(down_type, down_data, config.hidden_size, config.intermediate_size, down_scale, target_kernel, num_threads)?;
-
-            let attn_block = AttentionBlock::new(q_proj, k_proj, v_proj, o_proj, attn_sub_norm, &config);
-
-            blocks.push(TransformerBlock {
-                attn_norm,
-                attn: attn_block,
-                ffn_norm,
-                gate_proj,
-                up_proj,
-                ffn_sub_norm,
-                down_proj,
-                hidden_act: config.hidden_act,
-                rms_norm_eps: config.rms_norm_eps,
-                hidden_size: config.hidden_size,
-                intermediate_size: config.intermediate_size,
-            });
-        }
-
-        let lm_head_f16 = gguf.get_tensor_f16("output.weight").map(|s| s.to_vec());
-
-        let model = QuintritModel {
-            config: config.clone(),
-            token_embeddings,
-            blocks,
-            output_norm,
-            lm_head: None,
-            lm_head_f16,
+            // 6. Preallocate KV-Cache
+            progress!("==> Preallocating KV cache for {} tokens...", config.max_position_embeddings);
+            let kv_cache = KVCache::try_new(
+                config.num_hidden_layers,
+                config.max_position_embeddings,
+                config.num_key_value_heads,
+                config.head_dim,
+            )?;
+            (model, kv_cache)
         };
 
-        // 6. Preallocate KV-Cache
-        progress!("==> Preallocating KV cache for {} tokens...", config.max_position_embeddings);
-        let kv_cache = KVCache::try_new(
-            config.num_hidden_layers,
-            config.max_position_embeddings,
-            config.num_key_value_heads,
-            config.head_dim,
-        )?;
+        // Every tensor of the file must have been used: a tensor that no loader reads is a feature this runtime does not
+        // implement, and running the model without it would give wrong results.
+        let unread = gguf.unread_tensors();
+        if !unread.is_empty() {
+            let shown: Vec<&str> = unread.iter().take(8).map(String::as_str).collect();
+            return Err(format!(
+                "the file has {} tensor(s) this runtime does not use: {}{}",
+                unread.len(),
+                shown.join(", "),
+                if unread.len() > shown.len() { ", ..." } else { "" }
+            ));
+        }
 
         let sampler = Sampler::new(SamplingConfig::default());
         let scratchpad = crate::scratchpad::InferenceScratchpad::new(&config, config.max_position_embeddings);
@@ -540,6 +545,12 @@ impl InferenceEngine {
     fn reusable_prefix(&mut self, prompt_tokens: &[u32]) -> usize {
         let valid = self.kv_cache.reset_count() == self.cached_reset_count
             && self.kv_cache.len() == self.cached_tokens.len();
+        // A recurrent state cannot be rolled back: reuse it only when the prompt continues the cached sequence and
+        // at least one new token follows.
+        let valid = valid
+            && (!self.kv_cache.has_recurrent()
+                || (prompt_tokens.len() > self.cached_tokens.len()
+                    && prompt_tokens[..self.cached_tokens.len()] == self.cached_tokens[..]));
         let common = if valid {
             self.cached_tokens
                 .iter()
@@ -671,6 +682,7 @@ impl InferenceEngine {
                     TernaryKernelType::BitnetMad => "BitnetMad",
                     #[cfg(feature = "bitnet-baseline")]
                     TernaryKernelType::BitnetMad512 => "BitnetMad512",
+                    TernaryKernelType::QuintritBlockScaled => "QuintritBlockScaled",
                 };
                 *kernel_counts.entry(name.to_string()).or_insert(0) += 1;
             }
@@ -744,4 +756,40 @@ fn filter_stops<F: FnMut(&str)>(
         pending.drain(..safe);
     }
     false
+}
+
+/// Loads the projection `name` (`rows x cols`) for the requested kernel: `Q2_0` tensors become block-scaled layers
+/// (one scale per 64 weights), the per-tensor-scaled ternary formats (`I2_S`, `TQ1_0`, `TQ2_0`) are transcoded for
+/// `target_kernel`.
+pub(crate) fn load_projection(
+    gguf: &GgufFile,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    target_kernel: TernaryKernelType,
+    num_threads: usize,
+) -> Result<crate::layer::LinearLayer, String> {
+    let info = gguf.tensors.get(name).ok_or_else(|| format!("Missing {name}"))?;
+    if info.shape.len() != 2 || info.shape[0] != cols || info.shape[1] != rows {
+        return Err(format!("tensor '{name}' has shape {:?}, expected [{cols}, {rows}]", info.shape));
+    }
+    let data = gguf.get_tensor_data(name).ok_or_else(|| format!("Failed to read tensor '{name}'"))?;
+    if info.tensor_type == quintrit_format::GGML_TYPE_Q2_0 {
+        let block = info.block_size.ok_or_else(|| format!("tensor '{name}': unknown Q2_0 block size"))?;
+        let (trits, scales) = quintrit_format::decode_q2_0(data, rows, cols, block).map_err(|e| format!("{name}: {e}"))?;
+        let layer = crate::layer::BlockScaledLayer::new(&trits, scales, rows, cols, num_threads)?;
+        return Ok(crate::layer::LinearLayer::BlockScaled(layer));
+    }
+    let scale = match gguf.get_tensor_scale(name) {
+        Some(scale) => scale,
+        None => match info.tensor_type {
+            quintrit_format::GGML_TYPE_TQ1_0 | quintrit_format::GGML_TYPE_TQ2_0 => {
+                return Err(format!(
+                    "Tensor '{name}' has differing per-block scales, which a per-tensor weight scale cannot represent"
+                ));
+            }
+            _ => 1.0,
+        },
+    };
+    dispatch_ternary_layer(info.tensor_type, data, rows, cols, scale, target_kernel, num_threads)
 }

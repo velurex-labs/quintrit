@@ -18,9 +18,9 @@ name = "quintrit_c"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-quintrit-core = { path = "../quintrit-core", version = "0.1.0" }
-quintrit-format = { path = "../quintrit-format", version = "0.1.0" }
-quintrit-runtime = { path = "../quintrit-runtime", version = "0.1.0" }
+quintrit-core = { path = "../quintrit-core", version = "0.2.0" }
+quintrit-format = { path = "../quintrit-format", version = "0.2.0" }
+quintrit-runtime = { path = "../quintrit-runtime", version = "0.2.0" }
 
 [dev-dependencies]
 # Locates a C / C++ compiler (and the MSVC environment) for the C and C++ tests; the tests skip without one.

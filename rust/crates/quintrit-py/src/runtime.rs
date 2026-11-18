@@ -39,6 +39,9 @@ fn architecture_name(a: ModelArchitecture) -> &'static str {
         ModelArchitecture::BitNet => "bitnet",
         ModelArchitecture::Falcon3 => "falcon3",
         ModelArchitecture::Llama => "llama",
+        ModelArchitecture::Qwen3 => "qwen3",
+        ModelArchitecture::Qwen35 => "qwen35",
+        ModelArchitecture::NemotronHMoe => "nemotron_h_moe",
     }
 }
 

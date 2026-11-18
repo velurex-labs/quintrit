@@ -721,6 +721,8 @@ fn tiny_model_with(kind: TernaryKernelType, threads: usize) -> QuintritModel {
         output_norm: norm(&mut rng, h),
         lm_head: None,
         lm_head_f16: None,
+        embedding_layer: None,
+        hybrid: None,
         token_embeddings: embeddings,
         blocks,
         config: cfg,
@@ -1010,4 +1012,38 @@ fn quintrit_lut_kernels_reproduce_each_other_bit_for_bit_at_full_activation_rang
             );
         }
     }
+}
+
+/// Metadata that the runtime would silently ignore is an error (`validate::check_metadata_keys`).
+#[test]
+fn metadata_check_rejects_unknown_keys_and_unsupported_values() {
+    let check = |entries: &[(&str, MetaValue)]| {
+        let path = gguf_with_metadata(entries);
+        let gguf = quintrit_format::GgufFile::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        quintrit_runtime::validate::check_metadata_keys(&gguf)
+    };
+    let ok = [
+        ("general.architecture", MetaValue::Str("llama")),
+        ("general.name", MetaValue::Str("anything")),
+        ("llama.embedding_length", MetaValue::U32(256)),
+        ("tokenizer.ggml.model", MetaValue::Str("gpt2")),
+        ("tokenizer.ggml.add_bos_token", MetaValue::Bool(true)),
+    ];
+    assert!(check(&ok).is_ok());
+    let with = |extra: (&'static str, MetaValue)| {
+        let mut v: Vec<(&str, MetaValue)> = vec![
+            ("general.architecture", MetaValue::Str("llama")),
+            ("llama.embedding_length", MetaValue::U32(256)),
+        ];
+        v.push(extra);
+        check(&v)
+    };
+    assert!(with(("llama.attention.sliding_window", MetaValue::U32(4096))).unwrap_err().contains("sliding_window"));
+    assert!(with(("vendor.special", MetaValue::U32(1))).is_err());
+    assert!(with(("tokenizer.ggml.add_eos_token", MetaValue::Bool(true))).is_err());
+    assert!(with(("tokenizer.ggml.add_eos_token", MetaValue::Bool(false))).is_ok());
+    assert!(with(("tokenizer.ggml.model", MetaValue::Str("llama"))).is_err());
+    assert!(with(("llama.expert_group_count", MetaValue::U32(8))).is_err());
+    assert!(with(("prism.hadamard.unknown", MetaValue::U32(1))).is_err());
 }

@@ -23,6 +23,7 @@ fn damaged_models_are_rejected_by_the_engine_with_an_error() {
         ("short_norm", Flaws { short_norm: true, ..Default::default() }, "attn_norm"),
         ("vocab_mismatch", Flaws { vocab_mismatch: true, ..Default::default() }, "vocab_size"),
         ("odd_cols", Flaws { odd_i2s_cols: true, ..Default::default() }, "I2_S"),
+        ("unused_tensor", Flaws { extra_tensor: true, ..Default::default() }, "extra.tq2.weight"),
     ] {
         let path = dir.path(&format!("{name}.gguf"));
         write_model(&path, 5, &flaws);

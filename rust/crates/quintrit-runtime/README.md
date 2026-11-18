@@ -65,7 +65,11 @@ encoding; the C library and the Python package do not include them. Build with
 
 ## Modules
 
-- **`config`**: Architecture and hyperparameter detection from GGUF metadata (BitNet b1.58, Falcon3, LLaMA).
+- **`config`**: Architecture and hyperparameter detection from GGUF metadata (BitNet b1.58, Falcon3, LLaMA, Qwen3,
+  Qwen3.5, Nemotron-H MoE), including RoPE pairing, partial rotation and YaRN scaling.
+- **`hybrid`**: The layers that are not plain attention blocks: Qwen3.5 (Gated DeltaNet linear attention, gated
+  attention, Hadamard-folded weights) and Nemotron-H (Mamba-2, attention without RoPE, mixture of experts). The
+  recurrent state lives in the `KVCache`.
 - **`ops`**: High-performance mathematical primitives (RMSNorm, RoPE, Int8 activation quantization, SiLU, Squared ReLU, SwiGLU, FP16 conversions).
 - **`kv_cache`**: Contiguous preallocated Key-Value cache storing FP16 projections.
 - **`attention`**: Grouped-Query Attention with causal masking and sub-layer normalization.

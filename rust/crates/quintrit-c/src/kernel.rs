@@ -141,7 +141,7 @@ pub fn resolve_threads(threads: u32) -> Res<usize> {
 // Exported functions
 // ---------------------------------------------------------------------------------------------------------------------
 
-/// Returns the library version as a static NUL-terminated string, for example `"0.1.0"`.
+/// Returns the library version as a static NUL-terminated string, for example `"0.2.0"`.
 #[unsafe(no_mangle)]
 pub extern "C" fn quintrit_version() -> *const c_char {
     VERSION.as_ptr() as *const c_char

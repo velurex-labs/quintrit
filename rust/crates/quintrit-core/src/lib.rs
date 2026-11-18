@@ -18,6 +18,7 @@
 //! - [`simd`], [`lut`], [`pack`]: the Quintrit implementation (velurex encoding, 5 trits per byte).
 //!   This is where kernels are optimized and extended.
 
+pub mod block_scaled;
 pub mod limits;
 pub mod lut;
 pub mod pack;

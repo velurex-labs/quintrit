@@ -1,11 +1,11 @@
 //! Grouped-Query Attention (GQA) mechanism with causal KV cache support.
 
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, Numerics, RopeConfig};
 use crate::kv_cache::KVCache;
 use crate::layer::LinearLayer;
 use crate::ops::{
-    apply_rotary_emb, f16_to_f32, f32_to_f16, ggml_vec_dot_f16, ggml_vec_mad_f16,
-    ggml_vec_scale_f16, quantize_activations_int8_with_range, rms_norm,
+    apply_rope, f16_to_f32, f32_to_f16, ggml_vec_dot_f16, ggml_vec_dot_f16_f32, ggml_vec_mad_f16, ggml_vec_mad_f16_f32,
+    ggml_vec_scale_f16, quantize_activations_int8_with_range, quantize_q8_0, rms_norm,
 };
 
 /// Self-attention block implementing Grouped-Query Attention (GQA).
@@ -19,9 +19,17 @@ pub struct AttentionBlock {
     num_kv_heads: usize,
     head_dim: usize,
     gqa_ratio: usize,
-    rope_theta: f32,
+    /// Input (model) dimension of the Q, K and V projections.
+    hidden_size: usize,
+    rope: RopeConfig,
     rms_norm_eps: f32,
     scale_factor: f32,
+    /// RMSNorm weights applied to every query head before RoPE (`attn_q_norm`, `head_dim` values).
+    q_norm: Option<Vec<f32>>,
+    /// RMSNorm weights applied to every key head before RoPE (`attn_k_norm`, `head_dim` values).
+    k_norm: Option<Vec<f32>>,
+    /// Accumulate the attention values in FP32 (llama.cpp) instead of FP16 (bitnet.cpp).
+    f32_values: bool,
 }
 
 impl AttentionBlock {
@@ -47,10 +55,28 @@ impl AttentionBlock {
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             gqa_ratio,
-            rope_theta: config.rope_theta,
+            hidden_size: config.hidden_size,
+            // `rope_theta` and `head_dim` stay authoritative for the base frequency and the largest rotation width.
+            rope: RopeConfig {
+                freq_base: config.rope_theta,
+                n_dims: config.rope.n_dims.min(config.head_dim),
+                ..config.rope
+            },
             rms_norm_eps: config.rms_norm_eps,
             scale_factor,
+            q_norm: None,
+            k_norm: None,
+            f32_values: config.numerics == Numerics::LlamaCpp,
         }
+    }
+
+    /// Adds the per-head RMSNorm of the queries and keys (Qwen3), applied before RoPE.
+    pub fn with_qk_norm(mut self, q_norm: Vec<f32>, k_norm: Vec<f32>) -> Self {
+        assert_eq!(q_norm.len(), self.head_dim, "attn_q_norm length");
+        assert_eq!(k_norm.len(), self.head_dim, "attn_k_norm length");
+        self.q_norm = Some(q_norm);
+        self.k_norm = Some(k_norm);
+        self
     }
 
     /// Updates execution thread count for all attention projection layers.
@@ -93,7 +119,11 @@ impl AttentionBlock {
         kv_cache: &mut KVCache,
         scratchpad: &mut crate::scratchpad::InferenceScratchpad,
     ) {
-        let hidden_size = self.num_q_heads * self.head_dim;
+        if self.q_proj.is_block_scaled() {
+            self.forward_block_scaled(layer_idx, pos, kv_cache, scratchpad);
+            return;
+        }
+        let hidden_size = self.hidden_size;
         let q_dim = self.num_q_heads * self.head_dim;
         let kv_dim = self.num_kv_heads * self.head_dim;
 
@@ -155,14 +185,14 @@ impl AttentionBlock {
         );
 
         // 3. Apply RoPE rotary positional embeddings to Q and K
-        apply_rotary_emb(
+        apply_rope(
             &mut scratchpad.q[..q_dim],
             &mut scratchpad.k[..kv_dim],
             pos,
             self.num_q_heads,
             self.num_kv_heads,
             self.head_dim,
-            self.rope_theta,
+            &self.rope,
         );
 
         // 4. Append K and V into contiguous KV cache (FP16 precision)
@@ -184,38 +214,20 @@ impl AttentionBlock {
                 scratchpad.q_slice_f16[d] = f32_to_f16(q_slice[d]);
             }
 
-            // Online softmax with FP16 VKQ accumulator, identical to the ggml flash-attention
-            // kernel (ggml_compute_forward_flash_attn_ext_f16_one_chunk).
-            let mut s_sum: f32 = 0.0;
-            let mut max_score = f32::NEG_INFINITY;
-            let vkq16 = &mut scratchpad.head_out_f16[..self.head_dim];
-            vkq16.fill(0);
-            for p in 0..seq_len {
-                let k_past = kv_cache.get_key(layer_idx, p, kv_h);
-                let dot = ggml_vec_dot_f16(&scratchpad.q_slice_f16[..self.head_dim], k_past);
-                let score = dot * scale_factor;
-
-                let m_old = max_score;
-                let mut ms = 1.0f32;
-                let mut vs = 1.0f32;
-                if score > max_score {
-                    max_score = score;
-                    ms = (m_old - max_score).exp();
-                    ggml_vec_scale_f16(vkq16, ms);
-                } else {
-                    vs = (score - max_score).exp();
-                }
-                let v_past = kv_cache.get_val(layer_idx, p, kv_h);
-                ggml_vec_mad_f16(vkq16, v_past, vs);
-                // `S = S*ms + vs` is contracted into an FMA in the reference build.
-                s_sum = s_sum.mul_add(ms, vs);
-            }
-
-            let s_inv = if s_sum == 0.0 { 0.0 } else { 1.0 / s_sum };
             let head_out = &mut scratchpad.attn_out[h * self.head_dim..(h + 1) * self.head_dim];
-            for d in 0..self.head_dim {
-                head_out[d] = f16_to_f32(vkq16[d]) * s_inv;
-            }
+            attend_head(
+                &scratchpad.q_slice_f16[..self.head_dim],
+                &scratchpad.q[h * self.head_dim..(h + 1) * self.head_dim],
+                kv_cache,
+                layer_idx,
+                kv_h,
+                seq_len,
+                scale_factor,
+                &mut scratchpad.head_out_f16[..self.head_dim],
+                &mut scratchpad.head_acc[..self.head_dim],
+                head_out,
+                self.f32_values,
+            );
         }
 
         // 6. Sub-layer normalization (Sub-LN) if specified by architecture (e.g. BitNet)
@@ -247,6 +259,89 @@ impl AttentionBlock {
         );
     }
 
+
+    /// Forward pass for block-scaled (`Q2_0`) projections: the inputs of the projections are quantized to `Q8_0`, as
+    /// llama.cpp does before its `Q2_0 x Q8_0` dot products.
+    fn forward_block_scaled(
+        &self,
+        layer_idx: usize,
+        pos: usize,
+        kv_cache: &mut KVCache,
+        scratchpad: &mut crate::scratchpad::InferenceScratchpad,
+    ) {
+        let hidden_size = self.hidden_size;
+        let q_dim = self.num_q_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let nb = hidden_size / 32;
+
+        quantize_q8_0(&scratchpad.x_norm[..hidden_size], &mut scratchpad.q8_qs[..hidden_size], &mut scratchpad.q8_d[..nb]);
+        self.q_proj.forward_q8(&scratchpad.q8_qs[..hidden_size], &scratchpad.q8_d[..nb], &mut scratchpad.q[..q_dim]);
+        self.k_proj.forward_q8(&scratchpad.q8_qs[..hidden_size], &scratchpad.q8_d[..nb], &mut scratchpad.k[..kv_dim]);
+        self.v_proj.forward_q8(&scratchpad.q8_qs[..hidden_size], &scratchpad.q8_d[..nb], &mut scratchpad.v[..kv_dim]);
+
+        if let (Some(qn), Some(kn)) = (&self.q_norm, &self.k_norm) {
+            let hd = self.head_dim;
+            for h in 0..self.num_q_heads {
+                let head = &mut scratchpad.q[h * hd..(h + 1) * hd];
+                scratchpad.head_acc[..hd].copy_from_slice(head);
+                rms_norm(&scratchpad.head_acc[..hd], qn, self.rms_norm_eps, head);
+            }
+            for h in 0..self.num_kv_heads {
+                let head = &mut scratchpad.k[h * hd..(h + 1) * hd];
+                scratchpad.head_acc[..hd].copy_from_slice(head);
+                rms_norm(&scratchpad.head_acc[..hd], kn, self.rms_norm_eps, head);
+            }
+        }
+
+        apply_rope(
+            &mut scratchpad.q[..q_dim],
+            &mut scratchpad.k[..kv_dim],
+            pos,
+            self.num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            &self.rope,
+        );
+
+        for i in 0..kv_dim {
+            scratchpad.k_f16[i] = f32_to_f16(scratchpad.k[i]);
+            scratchpad.v_f16[i] = f32_to_f16(scratchpad.v[i]);
+        }
+        kv_cache.append(layer_idx, pos, &scratchpad.k_f16[..kv_dim], &scratchpad.v_f16[..kv_dim]);
+
+        let seq_len = pos + 1;
+        for h in 0..self.num_q_heads {
+            let kv_h = h / self.gqa_ratio;
+            let q_slice = &scratchpad.q[h * self.head_dim..(h + 1) * self.head_dim];
+            for d in 0..self.head_dim {
+                scratchpad.q_slice_f16[d] = f32_to_f16(q_slice[d]);
+            }
+            let head_out = &mut scratchpad.attn_out[h * self.head_dim..(h + 1) * self.head_dim];
+            attend_head(
+                &scratchpad.q_slice_f16[..self.head_dim],
+                &scratchpad.q[h * self.head_dim..(h + 1) * self.head_dim],
+                kv_cache,
+                layer_idx,
+                kv_h,
+                seq_len,
+                self.scale_factor,
+                &mut scratchpad.head_out_f16[..self.head_dim],
+                &mut scratchpad.head_acc[..self.head_dim],
+                head_out,
+                self.f32_values,
+            );
+        }
+
+        let o_in = if let Some(sub_norm) = &self.attn_sub_norm {
+            rms_norm(&scratchpad.attn_out[..q_dim], sub_norm, self.rms_norm_eps, &mut scratchpad.attn_sub_buf[..q_dim]);
+            &scratchpad.attn_sub_buf[..q_dim]
+        } else {
+            &scratchpad.attn_out[..q_dim]
+        };
+        let nq = q_dim / 32;
+        quantize_q8_0(o_in, &mut scratchpad.q8_qs[..q_dim], &mut scratchpad.q8_d[..nq]);
+        self.o_proj.forward_q8(&scratchpad.q8_qs[..q_dim], &scratchpad.q8_d[..nq], &mut scratchpad.attn_out[..hidden_size]);
+    }
 
     /// Total memory footprint of all attention weight matrices in bytes.
     pub fn memory_bytes(&self) -> usize {
@@ -289,5 +384,213 @@ impl AttentionBlock {
     /// Accessor for Output projection layer.
     pub fn o_proj(&self) -> &LinearLayer {
         &self.o_proj
+    }
+}
+
+/// Number of worker threads of the reference runtime whose split-KV attention reduction [`attend_head`] reproduces
+/// (the parity references are captured with `-t 4`).
+pub const REFERENCE_ATTENTION_THREADS: usize = 4;
+/// The reference runtime pads the number of KV cells it attends to (`n_kv`) to a multiple of this.
+pub const KV_PADDING: usize = 256;
+/// From this padded KV length on the reference splits the KV axis between its threads.
+pub const SPLIT_KV_MIN_LEN: usize = 512;
+
+/// Online softmax over the cached positions `range` of one head with an FP32 value accumulator, identical to
+/// upstream llama.cpp's `ggml_compute_forward_flash_attn_ext_f16_one_chunk`: the scores are
+/// `ggml_vec_dot_f16_f32(K, Q)` with the query in F32, the values are accumulated with `ggml_vec_scale_f32` and
+/// `ggml_vec_mad_f16_f32`. Returns `(M, S)`; the accumulator is left in `vkq32`.
+fn attend_range_f32(
+    q_f32: &[f32],
+    kv_cache: &KVCache,
+    layer: usize,
+    kv_head: usize,
+    range: std::ops::Range<usize>,
+    scale: f32,
+    vkq32: &mut [f32],
+) -> (f32, f32) {
+    let mut s_sum: f32 = 0.0;
+    let mut max_score = f32::NEG_INFINITY;
+    vkq32.fill(0.0);
+    for p in range {
+        let k_past = kv_cache.get_key(layer, p, kv_head);
+        let score = ggml_vec_dot_f16_f32(k_past, q_f32) * scale;
+
+        let m_old = max_score;
+        let mut ms = 1.0f32;
+        let mut vs = 1.0f32;
+        if score > max_score {
+            max_score = score;
+            ms = (m_old - max_score).exp();
+            for v in vkq32.iter_mut() {
+                *v *= ms;
+            }
+        } else {
+            vs = (score - max_score).exp();
+        }
+        ggml_vec_mad_f16_f32(vkq32, kv_cache.get_val(layer, p, kv_head), vs);
+        s_sum = s_sum.mul_add(ms, vs);
+    }
+    (max_score, s_sum)
+}
+
+/// Online softmax over the cached positions `range` of one head with an FP16 value accumulator, identical to ggml's
+/// `ggml_compute_forward_flash_attn_ext_f16_one_chunk`. Returns `(M, S)`; the accumulator is left in `vkq16`.
+fn attend_range(
+    q_f16: &[u16],
+    kv_cache: &KVCache,
+    layer: usize,
+    kv_head: usize,
+    range: std::ops::Range<usize>,
+    scale: f32,
+    vkq16: &mut [u16],
+) -> (f32, f32) {
+    let mut s_sum: f32 = 0.0;
+    let mut max_score = f32::NEG_INFINITY;
+    vkq16.fill(0);
+    for p in range {
+        let k_past = kv_cache.get_key(layer, p, kv_head);
+        let score = ggml_vec_dot_f16(q_f16, k_past) * scale;
+
+        let m_old = max_score;
+        let mut ms = 1.0f32;
+        let mut vs = 1.0f32;
+        if score > max_score {
+            max_score = score;
+            ms = (m_old - max_score).exp();
+            ggml_vec_scale_f16(vkq16, ms);
+        } else {
+            vs = (score - max_score).exp();
+        }
+        ggml_vec_mad_f16(vkq16, kv_cache.get_val(layer, p, kv_head), vs);
+        // `S = S*ms + vs` is contracted into an FMA in the reference build.
+        s_sum = s_sum.mul_add(ms, vs);
+    }
+    (max_score, s_sum)
+}
+
+/// Attention of one query head (already converted to FP16) over the first `seq_len` cached positions, written to
+/// `out` (`head_dim` values).
+///
+/// It reproduces the reference runtime's flash attention bit for bit, including the KV padding: while the padded KV
+/// length is below [`SPLIT_KV_MIN_LEN`] one online softmax runs over all positions; from there on the padded KV axis is
+/// split into [`REFERENCE_ATTENTION_THREADS`] equal chunks with separate FP16 accumulators whose partial results are
+/// combined in chunk order (`ggml_flash_attn_ext_reduce_partials`). The result does not depend on this runtime's own
+/// thread count.
+///
+/// `q_f16` is the query rounded to FP16 (bitnet.cpp converts it before the dot products), `q_f32` the query itself
+/// (llama.cpp keeps it in FP32); `f32_values` selects the llama.cpp arithmetic.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_head(
+    q_f16: &[u16],
+    q_f32: &[f32],
+    kv_cache: &KVCache,
+    layer: usize,
+    kv_head: usize,
+    seq_len: usize,
+    scale: f32,
+    vkq16: &mut [u16],
+    acc: &mut [f32],
+    out: &mut [f32],
+    f32_values: bool,
+) {
+    let n_kv = kv_cache.max_seq_len().min(seq_len.next_multiple_of(KV_PADDING).max(KV_PADDING));
+    if f32_values {
+        attend_head_f32(q_f32, kv_cache, layer, kv_head, seq_len, scale, n_kv, acc, out);
+        return;
+    }
+    if n_kv < SPLIT_KV_MIN_LEN {
+        let (_, s_sum) = attend_range(q_f16, kv_cache, layer, kv_head, 0..seq_len, scale, vkq16);
+        let s_inv = if s_sum == 0.0 { 0.0 } else { 1.0 / s_sum };
+        for (o, &v) in out.iter_mut().zip(vkq16.iter()) {
+            *o = f16_to_f32(v) * s_inv;
+        }
+        return;
+    }
+
+    let chunk = n_kv.div_ceil(REFERENCE_ATTENTION_THREADS);
+    let mut m_final = f32::NEG_INFINITY;
+    let mut s_final = 0.0f32;
+    acc.fill(0.0);
+    for c in 0..REFERENCE_ATTENTION_THREADS {
+        let start = c * chunk;
+        let end = (start + chunk).min(n_kv).min(seq_len);
+        if start >= end {
+            continue; // a chunk of masked cells only: S = 0, skipped by the reduction
+        }
+        let (m_chunk, s_chunk) = attend_range(q_f16, kv_cache, layer, kv_head, start..end, scale, vkq16);
+        if s_chunk == 0.0 {
+            continue;
+        }
+        let m_new = m_final.max(m_chunk);
+        let scale_old = (m_final - m_new).exp();
+        let scale_new = (m_chunk - m_new).exp();
+        for (a, &v) in acc.iter_mut().zip(vkq16.iter()) {
+            // `VKQ_final*scale_old + VKQ_chunk*scale_new`, contracted into one FMA.
+            *a = a.mul_add(scale_old, f16_to_f32(v) * scale_new);
+        }
+        s_final = s_final.mul_add(scale_old, s_chunk * scale_new);
+        m_final = m_new;
+    }
+    if s_final != 0.0 {
+        let s_inv = 1.0 / s_final;
+        for (o, &a) in out.iter_mut().zip(acc.iter()) {
+            *o = a * s_inv;
+        }
+    } else {
+        out.copy_from_slice(acc);
+    }
+}
+
+/// [`attend_head`] with FP32 value accumulators (upstream llama.cpp). `out` doubles as the per-chunk accumulator.
+#[allow(clippy::too_many_arguments)]
+fn attend_head_f32(
+    q_f32: &[f32],
+    kv_cache: &KVCache,
+    layer: usize,
+    kv_head: usize,
+    seq_len: usize,
+    scale: f32,
+    n_kv: usize,
+    acc: &mut [f32],
+    out: &mut [f32],
+) {
+    if n_kv < SPLIT_KV_MIN_LEN {
+        let (_, s_sum) = attend_range_f32(q_f32, kv_cache, layer, kv_head, 0..seq_len, scale, out);
+        let s_inv = if s_sum == 0.0 { 0.0 } else { 1.0 / s_sum };
+        for o in out.iter_mut() {
+            *o *= s_inv;
+        }
+        return;
+    }
+    let chunk = n_kv.div_ceil(REFERENCE_ATTENTION_THREADS);
+    let mut m_final = f32::NEG_INFINITY;
+    let mut s_final = 0.0f32;
+    acc.fill(0.0);
+    for c in 0..REFERENCE_ATTENTION_THREADS {
+        let start = c * chunk;
+        let end = (start + chunk).min(n_kv).min(seq_len);
+        if start >= end {
+            continue;
+        }
+        let (m_chunk, s_chunk) = attend_range_f32(q_f32, kv_cache, layer, kv_head, start..end, scale, out);
+        if s_chunk == 0.0 {
+            continue;
+        }
+        let m_new = m_final.max(m_chunk);
+        let scale_old = (m_final - m_new).exp();
+        let scale_new = (m_chunk - m_new).exp();
+        for (a, &v) in acc.iter_mut().zip(out.iter()) {
+            *a = a.mul_add(scale_old, v * scale_new);
+        }
+        s_final = s_final.mul_add(scale_old, s_chunk * scale_new);
+        m_final = m_new;
+    }
+    if s_final != 0.0 {
+        let s_inv = 1.0 / s_final;
+        for (o, &a) in out.iter_mut().zip(acc.iter()) {
+            *o = a * s_inv;
+        }
+    } else {
+        out.copy_from_slice(acc);
     }
 }

@@ -20,14 +20,14 @@ pub mod gguf;
 pub mod transcoder;
 
 pub use decoders::{
-    get_ternary_decoder, is_supported_ternary_type, supported_ternary_formats, uniform_block_scale,
+    decode_q2_0, get_ternary_decoder, is_supported_ternary_type, supported_ternary_formats, uniform_block_scale,
     I2sDecoder,
     TernaryDecoder, Tq1_0Decoder, Tq2_0Decoder, I2_S_DECODER, TQ1_0_DECODER, TQ2_0_DECODER,
 };
 
 pub use gguf::{
     GgufFile, GgufMetadataValue, GgufTensorInfo, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32,
-    GGML_TYPE_I2_S, GGML_TYPE_Q8_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0,
+    GGML_TYPE_I2_S, GGML_TYPE_Q2_0, GGML_TYPE_Q8_0, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0,
 };
 
 pub use transcoder::{

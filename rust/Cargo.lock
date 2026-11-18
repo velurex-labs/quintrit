@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "quintrit-bitnet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quintrit-core",
  "rayon",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "quintrit-c"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "quintrit-core",
@@ -397,14 +397,14 @@ dependencies = [
 
 [[package]]
 name = "quintrit-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
 ]
 
 [[package]]
 name = "quintrit-format"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "memmap2",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "quintrit-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "quintrit-bitnet",

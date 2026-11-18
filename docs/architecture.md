@@ -30,13 +30,13 @@ The bindings expose the same three levels:
 ```text
 GGUF file ──► quintrit-format ──► tiles in RAM ──► quintrit-core kernels ──► quintrit-runtime
  (I2_S, TQ1_0,   reader and         velurex          activation tables        forward pass,
-  TQ2_0)         decoders           encoding         and SIMD GEMV            sampling
+  TQ2_0, Q2_0)   decoders           encoding         and SIMD GEMV            sampling
 ```
 
 1. **Read.** `quintrit-format` reads GGUF v2 and v3. The file is treated as untrusted input: counts, lengths, shapes,
    offsets and the alignment are checked before anything is allocated, and a damaged file produces an error and
    never a panic.
-2. **Decode.** The ternary tensor types `I2_S` (2.00 bpw), `TQ1_0` and `TQ2_0` are decoded into one trit per byte.
+2. **Decode.** The ternary tensor types `I2_S` (2.00 bpw), `TQ1_0`, `TQ2_0` and `Q2_0` are decoded into one trit per byte (`Q2_0` also yields one scale per 64 weights, which the block-scaled kernel applies per 32-value activation block).
 3. **Transcode.** The trits are packed five per byte (velurex encoding, [`velurex-encoding.md`](velurex-encoding.md))
    and arranged in tiles: 32 rows per tile for AVX2 and NEON, 64 rows for AVX-512. This pass runs in parallel over
    the weight matrices when the model is loaded.

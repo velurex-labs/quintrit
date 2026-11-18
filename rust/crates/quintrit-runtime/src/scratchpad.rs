@@ -27,6 +27,12 @@ pub struct InferenceScratchpad {
     pub q_slice_f16: Vec<u16>,
     pub scores: Vec<f32>,
     pub head_out_f16: Vec<u16>,
+    /// F32 accumulator of the split-KV attention reduction (`head_dim`).
+    pub head_acc: Vec<f32>,
+    /// `Q8_0` codes of the input of a block-scaled projection (the widest input).
+    pub q8_qs: Vec<i8>,
+    /// `Q8_0` block scales of the input of a block-scaled projection.
+    pub q8_d: Vec<f32>,
     pub attn_sub_buf: Vec<f32>,
     pub o_int8: Vec<i8>,
 
@@ -43,6 +49,8 @@ pub struct InferenceScratchpad {
     pub qlut_buf: Vec<i8>,
     /// Scratch for the hi/lo activation split used while building wide QLUTs.
     pub act_split: Vec<i8>,
+    /// Buffers of the hybrid (linear-attention) layers, sized on first use.
+    pub hybrid: crate::hybrid::HybridScratch,
 }
 
 impl InferenceScratchpad {
@@ -75,7 +83,7 @@ impl InferenceScratchpad {
             logits: vec![0.0f32; vocab_size],
 
             x_norm: vec![0.0f32; hidden_size],
-            attn_out: vec![0.0f32; hidden_size],
+            attn_out: vec![0.0f32; hidden_size.max(q_dim)],
             ffn_out: vec![0.0f32; hidden_size],
             x_int8: vec![0i8; hidden_size],
 
@@ -87,6 +95,9 @@ impl InferenceScratchpad {
             q_slice_f16: vec![0u16; head_dim],
             scores: vec![0.0f32; effective_max_seq],
             head_out_f16: vec![0u16; head_dim],
+            head_acc: vec![0.0f32; head_dim],
+            q8_qs: vec![0i8; max_cols.max(q_dim)],
+            q8_d: vec![0.0f32; max_cols.max(q_dim).div_ceil(32)],
             attn_sub_buf: vec![0.0f32; q_dim],
             o_int8: vec![0i8; q_dim],
 
@@ -100,6 +111,7 @@ impl InferenceScratchpad {
 
             qlut_buf: vec![0i8; qlut_len],
             act_split: vec![0i8; 2 * max_cols],
+            hybrid: crate::hybrid::HybridScratch::default(),
         }
     }
 

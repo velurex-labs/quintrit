@@ -5,10 +5,12 @@
 //! conforming to the [`TernaryDecoder`] trait.
 
 pub mod i2_s;
+pub mod q2_0;
 pub mod tq1_0;
 pub mod tq2_0;
 
 pub use i2_s::I2sDecoder;
+pub use q2_0::decode_q2_0;
 pub use tq1_0::Tq1_0Decoder;
 pub use tq2_0::Tq2_0Decoder;
 

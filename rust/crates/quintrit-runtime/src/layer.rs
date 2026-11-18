@@ -25,6 +25,10 @@ pub enum TernaryKernelType {
     /// (2.00 bpw). Available with the cargo feature `bitnet-baseline`.
     #[cfg(feature = "bitnet-baseline")]
     BitnetMad512,
+    /// Quintrit block-scaled kernel for weights with one scale per 64 weights (llama.cpp `Q2_0`): 5 trits per byte
+    /// (velurex encoding) plus the scales, activations quantized in blocks of 32 (`Q8_0`). Chosen by the loader for
+    /// such tensors whatever kernel was requested; it reproduces llama.cpp's `Q2_0 x Q8_0` dot product bit for bit.
+    QuintritBlockScaled,
 }
 
 impl TernaryKernelType {
@@ -36,6 +40,7 @@ impl TernaryKernelType {
             Self::BitnetMad => "BitnetMad",
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad512 => "BitnetMad512",
+            Self::QuintritBlockScaled => "QuintritBlockScaled",
         }
     }
 
@@ -45,7 +50,7 @@ impl TernaryKernelType {
     /// full int8 range and use 127 levels.
     pub fn activation_quant_levels(&self) -> f32 {
         match self {
-            Self::QuintritLut | Self::QuintritLutAVX512 => 127.0,
+            Self::QuintritLut | Self::QuintritLutAVX512 | Self::QuintritBlockScaled => 127.0,
             // BitNet's reference runtime quantizes the activations of its multiply-add kernel to 127 levels.
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad | Self::BitnetMad512 => 127.0,
@@ -55,6 +60,8 @@ impl TernaryKernelType {
     pub fn bpw(&self) -> f32 {
         match self {
             Self::QuintritLut | Self::QuintritLutAVX512 => 1.6,
+            // 1.6 bits of trits plus one f32 scale per 64 weights.
+            Self::QuintritBlockScaled => 2.1,
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad | Self::BitnetMad512 => 2.0,
         }
@@ -401,6 +408,91 @@ impl TernaryGemvLayer for BitnetMadLayer {
 }
 
 // ============================================================================
+// Block-scaled layer (Q2_0 weights x Q8_0 activations)
+// ============================================================================
+
+/// Ternary projection with one scale per 64 weights of a row (llama.cpp `Q2_0`), stored in the velurex encoding.
+///
+/// Its input is quantized with [`crate::ops::quantize_q8_0`] (one scale per 32 values) instead of the per-tensor int8
+/// quantization of the other layers; [`BlockScaledLayer::forward_q8`] then reproduces llama.cpp's `Q2_0 x Q8_0` dot
+/// product bit for bit (see `quintrit_core::block_scaled`).
+#[derive(Clone)]
+pub struct BlockScaledLayer {
+    packed: Vec<u8>,
+    scales: Vec<f32>,
+    rows: usize,
+    cols: usize,
+    num_threads: usize,
+}
+
+impl BlockScaledLayer {
+    /// Packs `rows x cols` trits (row-major) with `rows * cols / 64` scales (row-major, one per 64 weights).
+    pub fn new(trits: &[i8], scales: Vec<f32>, rows: usize, cols: usize, num_threads: usize) -> Result<Self, String> {
+        use quintrit_core::block_scaled::SCALE_BLOCK;
+        if rows == 0 || cols == 0 || !cols.is_multiple_of(SCALE_BLOCK) {
+            return Err(format!(
+                "a {rows} x {cols} block-scaled projection needs a column count that is a multiple of {SCALE_BLOCK}"
+            ));
+        }
+        if trits.len() != rows * cols || scales.len() != rows * cols / SCALE_BLOCK {
+            return Err(format!(
+                "a {rows} x {cols} block-scaled projection got {} trits and {} scales",
+                trits.len(),
+                scales.len()
+            ));
+        }
+        Ok(Self {
+            packed: quintrit_core::pack::pack_matrix(trits, rows, cols),
+            scales,
+            rows,
+            cols,
+            num_threads: num_threads.max(1),
+        })
+    }
+
+    pub fn set_num_threads(&mut self, threads: usize) {
+        self.num_threads = threads.max(1);
+    }
+
+    /// `out = W x` for an input quantized by [`crate::ops::quantize_q8_0`] into `qs` (codes) and `d` (block scales).
+    pub fn forward_q8(&self, qs: &[i8], d: &[f32], out: &mut [f32]) {
+        quintrit_core::block_scaled::gemv_block_scaled_parallel(
+            &self.packed,
+            &self.scales,
+            qs,
+            d,
+            self.rows,
+            self.cols,
+            out,
+            self.num_threads,
+        );
+    }
+
+    /// Writes the dequantized row `r` (`trit * scale`, as ggml's `dequantize_row_q2_0`) into `out` (`cols` values).
+    pub fn dequantize_row(&self, r: usize, out: &mut [f32]) {
+        use quintrit_core::pack::{BLOCK_BYTES_5, BYTE_TO_TRITS, QK_5};
+        let rb = quintrit_core::block_scaled::row_bytes(self.cols);
+        let row = &self.packed[r * rb..(r + 1) * rb];
+        let sb = self.cols / quintrit_core::block_scaled::SCALE_BLOCK;
+        let scales = &self.scales[r * sb..(r + 1) * sb];
+        for (i, o) in out.iter_mut().enumerate().take(self.cols) {
+            let byte = row[(i / QK_5) * BLOCK_BYTES_5 + i % BLOCK_BYTES_5];
+            let t = BYTE_TO_TRITS[byte as usize][(i % QK_5) / BLOCK_BYTES_5];
+            *o = t as f32 * scales[i / quintrit_core::block_scaled::SCALE_BLOCK];
+        }
+    }
+
+    /// Bytes of the packed trits and the scales.
+    pub fn memory_bytes(&self) -> usize {
+        self.packed.len() + self.scales.len() * std::mem::size_of::<f32>()
+    }
+
+    pub fn shape(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+}
+
+// ============================================================================
 // Unified Linear Layer Container
 // ============================================================================
 
@@ -414,9 +506,26 @@ pub enum LinearLayer {
     /// BitNet multiply-add kernel (4 trits per byte, 2.00 bpw), comparison baseline.
     #[cfg(feature = "bitnet-baseline")]
     BitnetMad(BitnetMadLayer),
+    /// Ternary weights with one scale per 64 weights (`Q2_0`), fed with `Q8_0` activations.
+    BlockScaled(BlockScaledLayer),
 }
 
 impl LinearLayer {
+    /// Whether the layer takes `Q8_0` activations ([`LinearLayer::forward_q8`]) instead of per-tensor int8 ones.
+    #[inline]
+    pub fn is_block_scaled(&self) -> bool {
+        matches!(self, Self::BlockScaled(_))
+    }
+
+    /// `out = W x` for an input quantized by [`crate::ops::quantize_q8_0`]. Only for block-scaled layers.
+    #[inline]
+    pub fn forward_q8(&self, qs: &[i8], d: &[f32], out: &mut [f32]) {
+        match self {
+            Self::BlockScaled(l) => l.forward_q8(qs, d, out),
+            _ => panic!("forward_q8 needs a block-scaled layer"),
+        }
+    }
+
     /// Computes $y = \alpha \beta \cdot (W \cdot x)$.
     #[inline]
     pub fn forward(&self, activations: &[i8], act_scale: f32, out: &mut [f32]) {
@@ -425,6 +534,7 @@ impl LinearLayer {
             Self::QuintritAVX512(layer) => layer.forward(activations, act_scale, out),
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad(layer) => layer.forward(activations, act_scale, out),
+            Self::BlockScaled(_) => panic!("a block-scaled layer takes Q8_0 activations (forward_q8)"),
         }
     }
 
@@ -436,6 +546,7 @@ impl LinearLayer {
             Self::QuintritAVX512(layer) => layer.kernel_type(),
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad(layer) => layer.kernel_type(),
+            Self::BlockScaled(_) => TernaryKernelType::QuintritBlockScaled,
         }
     }
 
@@ -447,6 +558,7 @@ impl LinearLayer {
             Self::QuintritAVX512(layer) => layer.memory_bytes(),
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad(layer) => layer.memory_bytes(),
+            Self::BlockScaled(layer) => layer.memory_bytes(),
         }
     }
 
@@ -458,6 +570,7 @@ impl LinearLayer {
             Self::QuintritAVX512(layer) => layer.shape(),
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad(layer) => layer.shape(),
+            Self::BlockScaled(layer) => layer.shape(),
         }
     }
 
@@ -469,6 +582,7 @@ impl LinearLayer {
             Self::QuintritAVX512(layer) => layer.weight_scale(),
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad(layer) => layer.weight_scale(),
+            Self::BlockScaled(_) => 1.0,
         }
     }
 
@@ -480,6 +594,7 @@ impl LinearLayer {
             Self::QuintritAVX512(l) => l.num_threads,
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad(l) => l.num_threads,
+            Self::BlockScaled(l) => l.num_threads,
         }
     }
 
@@ -504,6 +619,7 @@ impl LinearLayer {
             // The BitNet kernel builds no activation table.
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad(l) => l.forward(activations, act_scale, out),
+            Self::BlockScaled(_) => panic!("a block-scaled layer takes Q8_0 activations (forward_q8)"),
         }
     }
 
@@ -516,6 +632,7 @@ impl LinearLayer {
             Self::QuintritAVX512(l) => l.set_num_threads(t),
             #[cfg(feature = "bitnet-baseline")]
             Self::BitnetMad(l) => l.set_num_threads(t),
+            Self::BlockScaled(l) => l.set_num_threads(t),
         }
     }
 }
@@ -606,6 +723,9 @@ pub fn dispatch_ternary_layer(
         TernaryKernelType::QuintritLutAVX512 => 32,
         #[cfg(feature = "bitnet-baseline")]
         TernaryKernelType::BitnetMad | TernaryKernelType::BitnetMad512 => 4,
+        TernaryKernelType::QuintritBlockScaled => {
+            return Err("the block-scaled kernel is selected per tensor for Q2_0 weights, not requested".to_string());
+        }
     };
     if rows == 0 || cols == 0 || !rows.is_multiple_of(tile_rows) {
         return Err(format!(
@@ -667,6 +787,7 @@ pub fn dispatch_ternary_layer(
             let packed = quintrit_bitnet::pack_trits_planar(&trits, rows, cols);
             Ok(LinearLayer::BitnetMad(BitnetMadLayer::new(packed, rows, cols, weight_scale, num_threads, avx512)))
         }
+        TernaryKernelType::QuintritBlockScaled => unreachable!("rejected above"),
     }
 }
 

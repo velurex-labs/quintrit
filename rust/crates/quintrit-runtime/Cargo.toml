@@ -11,8 +11,8 @@ categories.workspace = true
 description = "High-performance transformer inference engine and CLI for 1.60 bpw Velurex quantized models"
 
 [dependencies]
-quintrit-core = { path = "../quintrit-core", version = "0.1.0" }
-quintrit-format = { path = "../quintrit-format", version = "0.1.0" }
+quintrit-core = { path = "../quintrit-core", version = "0.2.0" }
+quintrit-format = { path = "../quintrit-format", version = "0.2.0" }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 ahash = "0.8"
 rayon = "1.10"

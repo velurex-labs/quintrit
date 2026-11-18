@@ -78,7 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `general.alignment` is not an unsigned power of two, or the data section would start beyond the end of the file;
 - a tensor has no dimension or more than eight, more than 2^40 elements, or dimensions whose product overflows;
 - a tensor offset is not a multiple of the alignment or lies outside the data section, a payload of a known type
-  (`F32`, `F16`, `BF16`, `Q8_0`, `I2_S`, `TQ1_0`, `TQ2_0`) extends beyond the end of the file, or two payloads overlap;
+  (`F32`, `F16`, `BF16`, `Q8_0`, `I2_S`, `TQ1_0`, `TQ2_0`, `Q2_0`) extends beyond the end of the file, or two payloads
+  overlap; the block size of `Q2_0` tensors (llama.cpp's 64 weights, or 128 in older files) is read from the layout
+  and decoded by `decode_q2_0`, which returns the trits with one scale per 64 weights;
 - a metadata key or tensor name occurs twice.
 
 The accessors (`get_tensor_data`, `get_tensor_f32`, ...) return `None` rather than reading out of bounds. A valid file

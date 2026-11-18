@@ -7,7 +7,7 @@ authors:
     given-names: "Lukáš"
 license: Apache-2.0
 repository-code: "https://github.com/velurex-labs/quintrit"
-version: "0.1.0"
+version: "0.2.0"
 keywords:
   - ternary quantization
   - velurex encoding

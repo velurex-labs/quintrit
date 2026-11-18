@@ -47,9 +47,9 @@ extern "C" {
 /* ----------------------------------------------------------------------------------------------------------------- */
 
 #define QUINTRIT_VERSION_MAJOR 0
-#define QUINTRIT_VERSION_MINOR 1
+#define QUINTRIT_VERSION_MINOR 2
 #define QUINTRIT_VERSION_PATCH 0
-#define QUINTRIT_VERSION_STRING "0.1.0"
+#define QUINTRIT_VERSION_STRING "0.2.0"
 
 /* ABI version of this header. Compare it with quintrit_abi_version() at start-up. */
 #define QUINTRIT_ABI_VERSION 1
@@ -102,7 +102,7 @@ QUINTRIT_API const char* quintrit_last_error_message(void);
 /* Library, CPU and kernel queries                                                                                    */
 /* ----------------------------------------------------------------------------------------------------------------- */
 
-/* Library version as a static string, for example "0.1.0". */
+/* Library version as a static string, for example "0.2.0". */
 QUINTRIT_API const char* quintrit_version(void);
 
 /* ABI version of the loaded library; it must equal QUINTRIT_ABI_VERSION. */

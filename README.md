@@ -47,7 +47,7 @@ The complete mathematical definition and derivation are documented in [`docs/vel
 ## Key Features
 
 - **Exact Integer Arithmetic:** Operates on the full activation range using a fused $x = 16 \cdot \text{hi} + \text{lo}$ split. Yields identical, bit-exact results across AVX2, AVX-512, and ARM NEON.
-- **Native GGUF Compatibility:** Directly loads standard GGUF models containing `I2_S`, `TQ1_0`, or `TQ2_0` tensors and transcodes them in memory into tiled SIMD layouts. This guarantees instant, zero-conversion compatibility with existing models from the `llama.cpp` and BitNet ecosystems without requiring separate weight distribution.
+- **Native GGUF Compatibility:** Directly loads standard GGUF models containing `I2_S`, `TQ1_0`, `TQ2_0` or `Q2_0` tensors and transcodes them in memory into velurex-encoded SIMD layouts (`Q2_0`, which has a scale per 64 weights, keeps its scales next to the trits). Supported architectures: BitNet b1.58, LLaMA and Falcon3 (including Falcon-E), Qwen3, Qwen3.5 and Nemotron-H MoE. This guarantees instant, zero-conversion compatibility with existing models from the `llama.cpp` and BitNet ecosystems without requiring separate weight distribution.
 - **Multi-Platform SIMD:** Hand-optimized kernels for x86-64 (AVX2, AVX-512 with VBMI/VNNI) and AArch64 (ARM NEON with DotProd and I8MM).
 - **Unified C / C++ / Python / Rust API:** Rust workspace (`quintrit-core`, `quintrit-format`, `quintrit-runtime`), C ABI (`libquintrit`), and Python bindings (`quintrit`).
 

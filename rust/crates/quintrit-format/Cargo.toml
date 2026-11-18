@@ -11,7 +11,7 @@ categories.workspace = true
 description = "GGUF model reader and dynamic in-memory transcoder into 1.60 bpw Velurex format"
 
 [dependencies]
-quintrit-core = { path = "../quintrit-core", version = "0.1.0" }
+quintrit-core = { path = "../quintrit-core", version = "0.2.0" }
 memmap2 = "0.9"
 rayon = "1.10"
 

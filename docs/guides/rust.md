@@ -12,8 +12,8 @@ Three crates, three levels. Use the one you need; each depends only on the ones 
 
 ```toml
 [dependencies]
-quintrit-core = "0.1"        # kernels
-quintrit-runtime = "0.1"     # engine and tokenizer (also pulls in quintrit-format)
+quintrit-core = "0.2"        # kernels
+quintrit-runtime = "0.2"     # engine and tokenizer (also pulls in quintrit-format)
 ```
 
 ## Kernel level: a matrix-vector product

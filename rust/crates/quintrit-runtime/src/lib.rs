@@ -22,9 +22,11 @@
 pub mod attention;
 pub mod config;
 pub mod engine;
+pub mod hybrid;
 pub mod kv_cache;
 pub mod layer;
 pub mod model;
+pub mod refsort;
 pub mod ops;
 pub mod sampler;
 pub mod scratchpad;
@@ -32,7 +34,7 @@ pub mod tokenizer;
 pub mod validate;
 pub mod verbosity;
 
-pub use config::{ActivationType, ModelArchitecture, ModelConfig};
+pub use config::{ActivationType, ModelArchitecture, ModelConfig, Numerics, RopeConfig, RopeMode};
 pub use engine::{format_chat_prompt, BenchmarkReport, ChatMessage, GenerationStats, InferenceEngine};
 pub use kv_cache::KVCache;
 pub use layer::{

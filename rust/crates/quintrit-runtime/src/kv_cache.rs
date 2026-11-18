@@ -38,6 +38,11 @@ pub struct KVCache {
     /// Number of calls to [`KVCache::reset`], so that a holder of cached positions can tell that someone else has
     /// started a new sequence in the meantime.
     reset_count: u64,
+    /// Recurrent state of the linear-attention layers of a hybrid model (convolution and SSM state per layer, F32),
+    /// zeroed by [`KVCache::reset`]. Empty for pure transformers.
+    recurrent: Vec<f32>,
+    /// `(offset, conv length, ssm length)` of every recurrent layer in `recurrent`.
+    recurrent_layout: Vec<(usize, usize, usize)>,
 }
 
 impl KVCache {
@@ -78,7 +83,41 @@ impl KVCache {
             v_buf,
             current_len: 0,
             reset_count: 0,
+            recurrent: Vec::new(),
+            recurrent_layout: Vec::new(),
         })
+    }
+
+    /// Like [`KVCache::try_new`] for the `num_layers` attention layers of a hybrid model, plus a recurrent state of
+    /// `(conv, ssm)` values for every recurrent layer.
+    pub fn try_new_hybrid(
+        num_layers: usize,
+        max_seq_len: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        recurrent: &[(usize, usize)],
+    ) -> Result<Self, String> {
+        let mut cache = Self::try_new(num_layers.max(1), max_seq_len, num_kv_heads, head_dim)?;
+        let mut off = 0usize;
+        for &(conv, ssm) in recurrent {
+            cache.recurrent_layout.push((off, conv, ssm));
+            off = off.checked_add(conv).and_then(|o| o.checked_add(ssm)).ok_or("recurrent state too large")?;
+        }
+        cache.recurrent = vec![0.0f32; off];
+        Ok(cache)
+    }
+
+    /// Whether the cache holds a recurrent state: its positions can then only be extended or reset, not truncated.
+    #[inline]
+    pub fn has_recurrent(&self) -> bool {
+        !self.recurrent_layout.is_empty()
+    }
+
+    /// `(convolution state, SSM state)` of recurrent layer `index`.
+    pub fn recurrent_state_mut(&mut self, index: usize) -> (&mut [f32], &mut [f32]) {
+        let (off, conv, ssm) = self.recurrent_layout[index];
+        let (a, b) = self.recurrent[off..off + conv + ssm].split_at_mut(conv);
+        (a, b)
     }
 
     /// Stores the key and value vectors for a given layer at generation step `pos`.
@@ -116,12 +155,20 @@ impl KVCache {
     pub fn reset(&mut self) {
         self.current_len = 0;
         self.reset_count = self.reset_count.wrapping_add(1);
+        self.recurrent.fill(0.0);
     }
 
     /// Keeps the first `len` positions and drops the rest, so that the next token can be appended at position `len`.
     ///
     /// Unlike [`KVCache::reset`], this continues the current sequence: positions below `len` stay valid.
+    ///
+    /// A cache with a recurrent state cannot drop positions (the state summarizes all of them); for it a shorter `len`
+    /// resets the cache instead.
     pub fn truncate(&mut self, len: usize) {
+        if self.has_recurrent() && len < self.current_len {
+            self.reset();
+            return;
+        }
         self.current_len = self.current_len.min(len);
     }
 
@@ -151,6 +198,6 @@ impl KVCache {
 
     /// Total memory consumption of both Key and Value buffers in bytes.
     pub fn memory_bytes(&self) -> usize {
-        (self.k_buf.len() + self.v_buf.len()) * size_of::<u16>()
+        (self.k_buf.len() + self.v_buf.len()) * size_of::<u16>() + self.recurrent.len() * size_of::<f32>()
     }
 }

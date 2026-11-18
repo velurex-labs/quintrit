@@ -29,6 +29,8 @@ pub struct Flaws {
     pub short_norm: bool,
     pub vocab_mismatch: bool,
     pub odd_i2s_cols: bool,
+    /// Adds a `TQ2_0` tensor that the model does not use (for the GGUF-level API tests; the engine rejects it).
+    pub extra_tensor: bool,
 }
 
 /// Original trits of every ternary tensor, by name: `(rows, cols, trits)`.
@@ -239,9 +241,11 @@ pub fn write_model(path: &Path, seed: u64, flaws: &Flaws) -> TritMap {
         i2s_tensor(&mut g, &mut trits, &mut rng, &format!("blk.{l}.ffn_down.weight"), HIDDEN, INTER);
     }
     // A tensor of another ternary format, not used by the model: 5 rows of 256 columns.
-    let tq = rng.trits(5 * 256);
-    g.tensor("extra.tq2.weight", &[256, 5], GGML_TYPE_TQ2_0, tq2_0_bytes(&tq));
-    trits.insert("extra.tq2.weight".into(), (5, 256, tq));
+    if flaws.extra_tensor {
+        let tq = rng.trits(5 * 256);
+        g.tensor("extra.tq2.weight", &[256, 5], GGML_TYPE_TQ2_0, tq2_0_bytes(&tq));
+        trits.insert("extra.tq2.weight".into(), (5, 256, tq));
+    }
 
     std::fs::write(path, g.finish()).unwrap();
     trits

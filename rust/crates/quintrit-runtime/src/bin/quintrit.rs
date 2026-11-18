@@ -233,6 +233,13 @@ fn main() {
         let arch = engine.model.config.architecture;
 
         let mut default_stops: Vec<String> = match arch {
+            quintrit_runtime::config::ModelArchitecture::Qwen3
+            | quintrit_runtime::config::ModelArchitecture::Qwen35
+            | quintrit_runtime::config::ModelArchitecture::NemotronHMoe => vec![
+                "<|im_end|>".to_string(),
+                "<|im_start|>".to_string(),
+                "<|endoftext|>".to_string(),
+            ],
             quintrit_runtime::config::ModelArchitecture::Falcon3 => vec![
                 "<|user|>".to_string(),
                 "<|endoftext|>".to_string(),

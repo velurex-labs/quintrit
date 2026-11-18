@@ -6,7 +6,7 @@
 //! front end (the Rust engine, the C library and the Python package) loads models through [`validate_gguf_model`].
 
 use crate::config::ModelConfig;
-use quintrit_format::{GgufFile, GgufMetadataValue, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I2_S};
+use quintrit_format::{GgufFile, GgufMetadataValue, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_I2_S, GGML_TYPE_Q2_0};
 
 /// Largest accepted size of the KV cache (keys and values, F16) for the full context of a model: 4 TiB. The cache is
 /// allocated lazily (zeroed pages), so only the part that is used occupies memory; the bound rejects hyper-parameters
@@ -32,18 +32,149 @@ const LIMITS: [(&str, usize); 7] = [
     ("context_length", 1 << 24),
 ];
 
+/// Hyper-parameter keys (after the `<architecture>.` prefix) that the loaders read and implement.
+const ARCH_KEYS: [&str; 33] = [
+    "vocab_size",
+    "context_length",
+    "embedding_length",
+    "block_count",
+    "feed_forward_length",
+    "attention.head_count",
+    "attention.head_count_kv",
+    "attention.key_length",
+    "attention.value_length",
+    "attention.layer_norm_rms_epsilon",
+    // Only the final layernorm of Nemotron-H's multi-token-prediction head uses it; that head is not run.
+    "attention.layer_norm_epsilon",
+    "rope.dimension_count",
+    "rope.dimension_sections",
+    "rope.freq_base",
+    "rope.scaling.type",
+    "rope.scaling.factor",
+    "rope.scaling.original_context_length",
+    "ssm.conv_kernel",
+    "ssm.state_size",
+    "ssm.group_count",
+    "ssm.inner_size",
+    "ssm.time_step_rank",
+    "full_attention_interval",
+    "expert_count",
+    "expert_used_count",
+    "expert_feed_forward_length",
+    "expert_shared_feed_forward_length",
+    "expert_shared_count",
+    "expert_weights_norm",
+    "expert_weights_scale",
+    "expert_group_count",
+    "expert_group_used_count",
+    // Informational in llama.cpp as well.
+    "rope.scaling.finetuned",
+];
+
+/// Tokenizer keys the loader reads (or that carry no meaning for byte-level BPE, such as the SentencePiece scores).
+const TOKENIZER_KEYS: [&str; 14] = [
+    "tokenizer.ggml.model",
+    "tokenizer.ggml.pre",
+    "tokenizer.ggml.tokens",
+    "tokenizer.ggml.token_type",
+    "tokenizer.ggml.merges",
+    "tokenizer.ggml.scores",
+    "tokenizer.ggml.bos_token_id",
+    "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.padding_token_id",
+    "tokenizer.ggml.unknown_token_id",
+    "tokenizer.ggml.add_bos_token",
+    "tokenizer.ggml.add_eos_token",
+    "tokenizer.ggml.add_space_prefix",
+    // The chat template is applied by the caller (`format_chat_prompt`); the runtime does not evaluate Jinja.
+    "tokenizer.chat_template",
+];
+
+/// The PrismML Hadamard keys that `hybrid` implements.
+const PRISM_KEYS: [&str; 11] = [
+    "prism.hadamard.version",
+    "prism.hadamard.tied_output",
+    "prism.hadamard.block_size",
+    "prism.hadamard.transform",
+    "prism.hadamard.axis",
+    "prism.hadamard.sign_mode",
+    "prism.hadamard.sign_widths",
+    "prism.hadamard.sign_values",
+    "prism.hadamard.weight_names",
+    "prism.hadamard.inverse_weight_names",
+    "prism.hadamard.gdn_v_grouped",
+];
+
+/// Rejects a file with metadata the runtime would silently ignore: every key under the architecture prefix, `tokenizer.`
+/// and `prism.` must be one the loaders implement, and the values the runtime does not implement (another tokenizer
+/// model, an added end-of-sequence token, a space prefix, grouped expert routing, value heads of another width) are
+/// errors. Keys under `general.` are descriptive (names, licence, sampling suggestions) and allowed.
+pub fn check_metadata_keys(g: &GgufFile) -> Result<(), String> {
+    let arch = g.metadata.get("general.architecture").and_then(|v| v.as_str()).unwrap_or("bitnet-b1.58");
+    let arch_prefix = format!("{arch}.");
+    let mut unknown = Vec::new();
+    for key in g.metadata.keys() {
+        let known = if key.starts_with("general.") {
+            true
+        } else if let Some(rest) = key.strip_prefix(&arch_prefix) {
+            ARCH_KEYS.contains(&rest)
+        } else if key.starts_with("tokenizer.") {
+            TOKENIZER_KEYS.contains(&key.as_str())
+        } else if key.starts_with("prism.") {
+            PRISM_KEYS.contains(&key.as_str())
+        } else {
+            false
+        };
+        if !known {
+            unknown.push(key.clone());
+        }
+    }
+    if !unknown.is_empty() {
+        unknown.sort();
+        return Err(format!("the file has metadata this runtime does not implement: {}", unknown.join(", ")));
+    }
+    let get = |k: &str| g.metadata.get(k);
+    if let Some(model) = get("tokenizer.ggml.model").and_then(|v| v.as_str()) {
+        if model != "gpt2" {
+            return Err(format!("tokenizer model '{model}' is not supported (only byte-level BPE, 'gpt2')"));
+        }
+    }
+    for flag in ["tokenizer.ggml.add_eos_token", "tokenizer.ggml.add_space_prefix"] {
+        if get(flag).and_then(|v| v.as_bool()) == Some(true) {
+            return Err(format!("metadata '{flag}' = true is not supported"));
+        }
+    }
+    for k in ["expert_group_count", "expert_group_used_count"] {
+        if get(&format!("{arch_prefix}{k}")).and_then(|v| v.as_u64()).is_some_and(|n| n > 1) {
+            return Err(format!("grouped expert routing ('{arch_prefix}{k}' > 1) is not supported"));
+        }
+    }
+    if let Some(n) = get(&format!("{arch_prefix}expert_shared_count")).and_then(|v| v.as_u64()) {
+        if n > 1 {
+            return Err(format!("{n} shared experts are not supported (at most one)"));
+        }
+    }
+    let key_len = get(&format!("{arch_prefix}attention.key_length")).and_then(|v| v.as_u64());
+    let value_len = get(&format!("{arch_prefix}attention.value_length")).and_then(|v| v.as_u64());
+    if value_len.is_some() && value_len != key_len {
+        return Err(format!("attention value length {value_len:?} differs from the key length {key_len:?}"));
+    }
+    Ok(())
+}
+
 /// Checks the hyper-parameters read from the metadata of a model whose architecture key prefix is `arch`.
 ///
 /// `values` are, in the order of the limits: vocabulary size, embedding length, feed-forward length, block count, head
-/// count, KV head count and context length.
-pub(crate) fn check_hyperparameters(arch: &str, values: [usize; 7]) -> Result<(), String> {
+/// count, KV head count and context length. `head_dim` is the explicit head dimension (`attention.key_length`) when the
+/// file gives one; otherwise the embedding length must split evenly into the heads.
+pub(crate) fn check_hyperparameters(arch: &str, values: [usize; 7], head_dim: Option<usize>) -> Result<(), String> {
     for ((name, max), v) in LIMITS.iter().zip(values) {
         if v == 0 || v > *max {
             return Err(format!("metadata '{arch}.{name}' = {v} is outside 1..={max}"));
         }
     }
     let [_, hidden, _, layers, heads, kv_heads, ctx] = values;
-    if !hidden.is_multiple_of(heads) || !(hidden / heads).is_multiple_of(2) {
+    if head_dim.is_none() && (!hidden.is_multiple_of(heads) || !(hidden / heads).is_multiple_of(2)) {
         return Err(format!(
             "embedding_length {hidden} must be divisible by head_count {heads} with an even head dimension"
         ));
@@ -51,7 +182,7 @@ pub(crate) fn check_hyperparameters(arch: &str, values: [usize; 7]) -> Result<()
     if !heads.is_multiple_of(kv_heads) {
         return Err(format!("head_count {heads} must be a multiple of head_count_kv {kv_heads}"));
     }
-    match kv_cache_bytes(layers, ctx, kv_heads, hidden / heads) {
+    match kv_cache_bytes(layers, ctx, kv_heads, head_dim.unwrap_or(hidden / heads)) {
         Some(bytes) if bytes <= MAX_KV_CACHE_BYTES => Ok(()),
         _ => Err(format!(
             "a context of {ctx} tokens with {layers} layers and {kv_heads} KV heads needs an unreasonably large KV cache"
@@ -67,6 +198,7 @@ pub(crate) fn check_hyperparameters(arch: &str, values: [usize; 7]) -> Result<()
 /// The ternary projections themselves are checked by their decoders while they are transcoded.
 pub fn validate_gguf_model(g: &GgufFile) -> Result<ModelConfig, String> {
     let config = ModelConfig::from_gguf(g)?;
+    check_metadata_keys(g)?;
     let vocab = config.vocab_size;
     let hidden = config.hidden_size;
     let inter = config.intermediate_size;
@@ -95,14 +227,29 @@ pub fn validate_gguf_model(g: &GgufFile) -> Result<ModelConfig, String> {
         Ok(())
     };
     // `vocab * hidden` cannot overflow: both are bounded by `check_hyperparameters`.
-    expect("token_embd.weight", GGML_TYPE_F16, vocab * hidden, false)?;
+    // The embedding table and the output head are F16, or Q2_0 in the ternary-embedding models (Ternary Bonsai).
+    let table_type = |name: &str| match g.tensors.get(name).map(|t| t.tensor_type) {
+        Some(GGML_TYPE_Q2_0) => GGML_TYPE_Q2_0,
+        Some(quintrit_format::GGML_TYPE_Q8_0) => quintrit_format::GGML_TYPE_Q8_0,
+        _ => GGML_TYPE_F16,
+    };
+    expect("token_embd.weight", table_type("token_embd.weight"), vocab * hidden, false)?;
     expect("output_norm.weight", GGML_TYPE_F32, hidden, false)?;
     if g.tensors.contains_key("output.weight") {
-        expect("output.weight", GGML_TYPE_F16, vocab * hidden, false)?;
+        expect("output.weight", table_type("output.weight"), vocab * hidden, false)?;
     }
-    for l in 0..config.num_hidden_layers {
+    // The hybrid architectures check their own layers while they are loaded.
+    let dense = !matches!(
+        config.architecture,
+        crate::config::ModelArchitecture::Qwen35 | crate::config::ModelArchitecture::NemotronHMoe
+    );
+    for l in (0..config.num_hidden_layers).filter(|_| dense) {
         expect(&format!("blk.{l}.attn_norm.weight"), GGML_TYPE_F32, hidden, false)?;
         expect(&format!("blk.{l}.ffn_norm.weight"), GGML_TYPE_F32, hidden, false)?;
+        if config.qk_norm {
+            expect(&format!("blk.{l}.attn_q_norm.weight"), GGML_TYPE_F32, config.head_dim, false)?;
+            expect(&format!("blk.{l}.attn_k_norm.weight"), GGML_TYPE_F32, config.head_dim, false)?;
+        }
         if config.has_sub_norm {
             expect(&format!("blk.{l}.attn_sub_norm.weight"), GGML_TYPE_F32, q_dim, true)?;
             expect(&format!("blk.{l}.ffn_sub_norm.weight"), GGML_TYPE_F32, inter, true)?;

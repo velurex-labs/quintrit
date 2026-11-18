@@ -9,7 +9,7 @@ use crate::kv_cache::KVCache;
 use crate::layer::LinearLayer;
 use crate::ops::{
     add_residual, elementwise_mul, f16_to_f32, f32_to_f16, ggml_vec_dot_f16,
-    quantize_activations_int8_with_range, relu2, rms_norm, swiglu,
+    quantize_activations_int8_with_range, quantize_q8_0, relu2, rms_norm, swiglu,
 };
 use rayon::prelude::*;
 
@@ -91,6 +91,12 @@ impl TransformerBlock {
             self.rms_norm_eps,
             &mut scratchpad.x_norm[..hidden_size],
         );
+
+        if self.gate_proj.is_block_scaled() {
+            self.ffn_block_scaled(scratchpad);
+            add_residual(&mut scratchpad.x[..hidden_size], &scratchpad.ffn_out[..hidden_size]);
+            return;
+        }
 
         let ffn_act_scale = quantize_activations_int8_with_range(
             &scratchpad.x_norm[..hidden_size],
@@ -197,6 +203,32 @@ impl TransformerBlock {
     }
 }
 
+impl TransformerBlock {
+    /// FFN of block-scaled (`Q2_0`) projections on `scratchpad.x_norm`, result in `scratchpad.ffn_out`: the inputs of
+    /// the projections are quantized to `Q8_0` as llama.cpp does.
+    fn ffn_block_scaled(&self, scratchpad: &mut crate::scratchpad::InferenceScratchpad) {
+        let (h, n) = (self.hidden_size, self.intermediate_size);
+        quantize_q8_0(&scratchpad.x_norm[..h], &mut scratchpad.q8_qs[..h], &mut scratchpad.q8_d[..h / 32]);
+        self.gate_proj.forward_q8(&scratchpad.q8_qs[..h], &scratchpad.q8_d[..h / 32], &mut scratchpad.gate[..n]);
+        self.up_proj.forward_q8(&scratchpad.q8_qs[..h], &scratchpad.q8_d[..h / 32], &mut scratchpad.up[..n]);
+        match self.hidden_act {
+            ActivationType::Relu2 => {
+                relu2(&scratchpad.gate[..n], &mut scratchpad.act_gate[..n]);
+                elementwise_mul(&scratchpad.act_gate[..n], &scratchpad.up[..n], &mut scratchpad.inter[..n]);
+            }
+            ActivationType::Silu => swiglu(&scratchpad.gate[..n], &scratchpad.up[..n], &mut scratchpad.inter[..n]),
+        }
+        let down_in = if let Some(sub_norm) = &self.ffn_sub_norm {
+            rms_norm(&scratchpad.inter[..n], sub_norm, self.rms_norm_eps, &mut scratchpad.ffn_sub_buf[..n]);
+            &scratchpad.ffn_sub_buf[..n]
+        } else {
+            &scratchpad.inter[..n]
+        };
+        quantize_q8_0(down_in, &mut scratchpad.q8_qs[..n], &mut scratchpad.q8_d[..n / 32]);
+        self.down_proj.forward_q8(&scratchpad.q8_qs[..n], &scratchpad.q8_d[..n / 32], &mut scratchpad.ffn_out[..h]);
+    }
+}
+
 /// Complete autoregressive ternary causal language model.
 pub struct QuintritModel {
     pub config: ModelConfig,
@@ -210,6 +242,11 @@ pub struct QuintritModel {
     pub lm_head: Option<LinearLayer>,
     /// Optional separate F16 LM head embedding table for untied models: [vocab_size, hidden_size].
     pub lm_head_f16: Option<Vec<u16>>,
+    /// Token embedding table stored as a block-scaled (`Q2_0`) layer `[vocab_size, hidden_size]`; then
+    /// `token_embeddings` is empty and a row is dequantized per token (ggml `get_rows`).
+    pub embedding_layer: Option<LinearLayer>,
+    /// The decoder stack of a hybrid model (Qwen3.5); `blocks` is then empty and the output head is part of it.
+    pub hybrid: Option<crate::hybrid::HybridModel>,
 }
 
 impl QuintritModel {
@@ -220,6 +257,12 @@ impl QuintritModel {
         }
         if let Some(ref mut lm_head) = self.lm_head {
             lm_head.set_num_threads(threads);
+        }
+        if let Some(ref mut emb) = self.embedding_layer {
+            emb.set_num_threads(threads);
+        }
+        if let Some(ref mut h) = self.hybrid {
+            h.set_num_threads(threads);
         }
     }
 
@@ -249,11 +292,28 @@ impl QuintritModel {
         assert!((token_id as usize) < vocab_size, "Token ID exceeds vocabulary size");
         assert_eq!(logits.len(), vocab_size, "Logits buffer must match vocabulary size");
 
-        // 1. Token Embedding lookup (F16 -> F32)
-        let emb_offset = (token_id as usize) * hidden_size;
-        let emb_slice = &self.token_embeddings[emb_offset..emb_offset + hidden_size];
-        for i in 0..hidden_size {
-            scratchpad.x[i] = f16_to_f32(emb_slice[i]);
+        if let Some(hybrid) = &self.hybrid {
+            hybrid.embed(token_id as usize, &mut scratchpad.x[..hidden_size]);
+            let mut hs = std::mem::take(&mut scratchpad.hybrid);
+            hybrid.forward_layers(&mut scratchpad.x[..hidden_size], pos, kv_cache, self.config.rms_norm_eps, &mut hs);
+            rms_norm(&scratchpad.x[..hidden_size], &self.output_norm, self.config.rms_norm_eps, &mut scratchpad.x_final[..hidden_size]);
+            let mut ps = crate::hybrid::ProjScratch::default();
+            std::mem::swap(&mut ps, hs.proj_mut());
+            hybrid.output.forward(&scratchpad.x_final[..hidden_size], logits, &mut ps);
+            std::mem::swap(&mut ps, hs.proj_mut());
+            scratchpad.hybrid = hs;
+            return;
+        }
+
+        // 1. Token Embedding lookup (F16 -> F32, or a dequantized Q2_0 row)
+        if let Some(LinearLayer::BlockScaled(emb)) = &self.embedding_layer {
+            emb.dequantize_row(token_id as usize, &mut scratchpad.x[..hidden_size]);
+        } else {
+            let emb_offset = (token_id as usize) * hidden_size;
+            let emb_slice = &self.token_embeddings[emb_offset..emb_offset + hidden_size];
+            for i in 0..hidden_size {
+                scratchpad.x[i] = f16_to_f32(emb_slice[i]);
+            }
         }
 
         // 2. Pass sequentially through all transformer blocks
@@ -271,7 +331,11 @@ impl QuintritModel {
         );
 
         // 4. Compute vocabulary logits
-        if let Some(lm_head_layer) = &self.lm_head {
+        if let Some(lm_head_layer) = self.lm_head.as_ref().filter(|l| l.is_block_scaled()) {
+            let nb = hidden_size / 32;
+            quantize_q8_0(&scratchpad.x_final[..hidden_size], &mut scratchpad.q8_qs[..hidden_size], &mut scratchpad.q8_d[..nb]);
+            lm_head_layer.forward_q8(&scratchpad.q8_qs[..hidden_size], &scratchpad.q8_d[..nb], logits);
+        } else if let Some(lm_head_layer) = &self.lm_head {
             let act_scale = quantize_activations_int8_with_range(
                 &scratchpad.x_final[..hidden_size],
                 &mut scratchpad.x_int8[..hidden_size],

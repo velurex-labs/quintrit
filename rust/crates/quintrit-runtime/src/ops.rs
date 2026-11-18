@@ -112,73 +112,111 @@ pub fn apply_rotary_emb(
     head_dim: usize,
     theta_base: f32,
 ) {
-    let half_dim = head_dim / 2;
+    let rope = crate::config::RopeConfig::plain(crate::config::RopeMode::Normal, head_dim / 2 * 2, theta_base, 0);
+    apply_rope(q, k, pos, num_q_heads, num_kv_heads, head_dim, &rope);
+}
 
-    // The rotation angles only depend on the position, so build the cos/sin cache once and
-    // share it between all Q and K heads (same recurrence as ggml_rope_cache_init).
-    let n_dims = (half_dim * 2) as f32;
-    let theta_scale = theta_base.powf(-2.0 / n_dims);
-    let mut theta = pos as f32;
-    let mut cache = Vec::with_capacity(half_dim * 2);
-    for _ in 0..half_dim {
-        cache.push(theta.cos());
-        cache.push(theta.sin());
-        theta *= theta_scale;
+/// Builds the cos/sin cache of one position exactly like ggml's `ggml_rope_cache_init` with `rope_yarn`:
+/// `cache[2i] = cos(theta_i) * mscale`, `cache[2i+1] = sin(theta_i) * mscale` for `i < n_dims / 2`.
+pub fn rope_cache(pos: usize, rope: &crate::config::RopeConfig, cache: &mut Vec<f32>) {
+    let n_dims = rope.n_dims;
+    cache.clear();
+    let theta_scale = rope.freq_base.powf(-2.0 / n_dims as f32);
+    let corr_dims = rope_yarn_corr_dims(n_dims, rope.n_ctx_orig, rope.freq_base, rope.beta_fast, rope.beta_slow);
+    let mut theta_extrap = pos as f32;
+    for i0 in (0..n_dims).step_by(2) {
+        let theta_interp = rope.freq_scale * theta_extrap;
+        let mut theta = theta_interp;
+        let mut mscale = rope.attn_factor;
+        if rope.ext_factor != 0.0 {
+            let ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], i0) * rope.ext_factor;
+            // `theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix`, contracted by clang into one FMA.
+            theta = theta_interp.mul_add(1.0 - ramp_mix, theta_extrap * ramp_mix);
+            mscale *= 0.1f32.mul_add((1.0 / rope.freq_scale).ln(), 1.0);
+        }
+        cache.push(theta.cos() * mscale);
+        cache.push(theta.sin() * mscale);
+        theta_extrap *= theta_scale;
     }
+}
 
+fn rope_yarn_ramp(low: f32, high: f32, i0: usize) -> f32 {
+    let y = ((i0 / 2) as f32 - low) / (high - low).max(0.001);
+    1.0 - y.max(0.0).min(1.0)
+}
+
+/// ggml's `ggml_rope_yarn_corr_dims` with `truncate` set (the default of `ggml_rope_ext`).
+fn rope_yarn_corr_dims(n_dims: usize, n_ctx_orig: usize, freq_base: f32, beta_fast: f32, beta_slow: f32) -> [f32; 2] {
+    let corr_dim = |n_rot: f32| {
+        n_dims as f32 * (n_ctx_orig as f32 / (n_rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * freq_base.ln())
+    };
+    let start = corr_dim(beta_fast).floor();
+    let end = corr_dim(beta_slow).ceil();
+    [start.max(0.0), end.min(n_dims as f32 - 1.0)]
+}
+
+/// Applies RoPE to `num_q_heads` query heads in `q` and `num_kv_heads` key heads in `k` (each `head_dim` long) at
+/// position `pos`. Only the first `rope.n_dims` coordinates of every head are rotated (ggml `ggml_rope_ext`).
+pub fn apply_rope(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rope: &crate::config::RopeConfig,
+) {
+    let mut cache = Vec::with_capacity(rope.n_dims);
+    rope_cache(pos, rope, &mut cache);
+    apply_rope_cached(q, num_q_heads, head_dim, rope.mode, &cache);
+    apply_rope_cached(k, num_kv_heads, head_dim, rope.mode, &cache);
+}
+
+/// Rotates `heads` heads of `head_dim` coordinates in `x` with a cache built by [`rope_cache`].
+pub fn apply_rope_cached(x: &mut [f32], heads: usize, head_dim: usize, mode: crate::config::RopeMode, cache: &[f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("fma") {
-            unsafe { rotate_heads_fma(q, k, num_q_heads, num_kv_heads, head_dim, &cache) };
+            unsafe { rotate_heads_fma(x, heads, head_dim, mode, cache) };
             return;
         }
     }
-    rotate_heads(q, k, num_q_heads, num_kv_heads, head_dim, &cache);
+    rotate_heads(x, heads, head_dim, mode, cache);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma")]
-unsafe fn rotate_heads_fma(
-    q: &mut [f32],
-    k: &mut [f32],
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    cache: &[f32],
-) {
-    rotate_heads(q, k, num_q_heads, num_kv_heads, head_dim, cache);
+unsafe fn rotate_heads_fma(x: &mut [f32], heads: usize, head_dim: usize, mode: crate::config::RopeMode, cache: &[f32]) {
+    rotate_heads(x, heads, head_dim, mode, cache);
 }
 
-/// Rotates every Q and K head. The products are contracted into fused multiply-adds, which is
+/// Rotates every head. The products are contracted into fused multiply-adds, which is
 /// what the reference build emits for `x0*cos - x1*sin` and `x0*sin + x1*cos`
 /// (`fma(x0, cos, -(x1*sin))` and `fma(x0, sin, x1*cos)`).
 #[inline(always)]
-fn rotate_heads(
-    q: &mut [f32],
-    k: &mut [f32],
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    cache: &[f32],
-) {
-    for h in 0..num_q_heads {
-        rotate_head(&mut q[h * head_dim..(h + 1) * head_dim], cache);
-    }
-    for h in 0..num_kv_heads {
-        rotate_head(&mut k[h * head_dim..(h + 1) * head_dim], cache);
+fn rotate_heads(x: &mut [f32], heads: usize, head_dim: usize, mode: crate::config::RopeMode, cache: &[f32]) {
+    for h in 0..heads {
+        let head = &mut x[h * head_dim..(h + 1) * head_dim];
+        match mode {
+            crate::config::RopeMode::Normal => rotate_head(head, cache, 1, 2),
+            crate::config::RopeMode::Neox => rotate_head(head, cache, cache.len() / 2, 1),
+        }
     }
 }
 
+/// ggml `rotate_pairs`: pair `i` (for `i < cache.len() / 2`) rotates `head[i * stride]` and
+/// `head[i * stride + offset]`.
 #[inline(always)]
-fn rotate_head(head: &mut [f32], cache: &[f32]) {
+fn rotate_head(head: &mut [f32], cache: &[f32], offset: usize, stride: usize) {
     for i in 0..cache.len() / 2 {
         let cos_val = cache[2 * i];
         let sin_val = cache[2 * i + 1];
-        let x0 = head[2 * i];
-        let x1 = head[2 * i + 1];
+        let a = i * stride;
+        let x0 = head[a];
+        let x1 = head[a + offset];
 
-        head[2 * i] = x0.mul_add(cos_val, -(x1 * sin_val));
-        head[2 * i + 1] = x0.mul_add(sin_val, x1 * cos_val);
+        head[a] = x0.mul_add(cos_val, -(x1 * sin_val));
+        head[a + offset] = x0.mul_add(sin_val, x1 * cos_val);
     }
 }
 
@@ -497,6 +535,377 @@ pub fn f16_to_f32_soft(h: u16) -> f32 {
     } else {
         let new_exp = exp + 127 - 15;
         f32::from_bits((sign << 31) | (new_exp << 23) | (mant << 13))
+    }
+}
+
+/// Dot product of an F16 vector `x` with an F32 vector `y`, bit-identical to upstream llama.cpp's
+/// `ggml_vec_dot_f16_f32` (AVX2 + F16C code path) on every platform: four accumulators of eight lanes take
+/// `fma(x, y, acc)` for every 32 values (the first accumulator also for a remaining group of 8), the accumulators are
+/// added as `(a0 + a1) + (a2 + a3)`, the lanes as `((l0+l4) + (l2+l6)) + ((l1+l5) + (l3+l7))`, and values beyond the
+/// last group of 8 are added in double precision.
+pub fn ggml_vec_dot_f16_f32(x: &[u16], y: &[f32]) -> f32 {
+    assert_eq!(x.len(), y.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            // SAFETY: AVX-512F, F16C and FMA are available; the lengths are equal.
+            return unsafe { ggml_vec_dot_f16_f32_avx512(x, y) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the AArch64 baseline; the lengths are equal.
+        return unsafe { ggml_vec_dot_f16_f32_neon(x, y) };
+    }
+    #[allow(unreachable_code)]
+    ggml_vec_dot_f16_f32_scalar(x, y)
+}
+
+/// The definition of [`ggml_vec_dot_f16_f32`] (portable code, the same order of operations).
+pub fn ggml_vec_dot_f16_f32_scalar(x: &[u16], y: &[f32]) -> f32 {
+    assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let mut acc = [[0.0f32; 8]; 4];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (j, a) in acc.iter_mut().enumerate() {
+            for (l, lane) in a.iter_mut().enumerate() {
+                let k = i + 8 * j + l;
+                *lane = f16_to_f32(x[k]).mul_add(y[k], *lane);
+            }
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        for (l, lane) in acc[0].iter_mut().enumerate() {
+            *lane = f16_to_f32(x[i + l]).mul_add(y[i + l], *lane);
+        }
+        i += 8;
+    }
+    let mut a = [0.0f32; 8];
+    for l in 0..8 {
+        a[l] = (acc[0][l] + acc[1][l]) + (acc[2][l] + acc[3][l]);
+    }
+    let r = [a[0] + a[4], a[1] + a[5], a[2] + a[6], a[3] + a[7]];
+    let mut sum = ((r[0] + r[2]) + (r[1] + r[3])) as f64;
+    for k in i..n {
+        sum += (f16_to_f32(x[k]) * y[k]) as f64;
+    }
+    sum as f32
+}
+
+/// `((l0+l4) + (l1+l5)) + ((l2+l6) + (l3+l7))`: ggml's `GGML_F32x8_REDUCE` tail (`_mm_hadd_ps` twice).
+#[inline(always)]
+fn hadd_reduce8(a: &[f32; 8]) -> f32 {
+    let t = [a[0] + a[4], a[1] + a[5], a[2] + a[6], a[3] + a[7]];
+    (t[0] + t[1]) + (t[2] + t[3])
+}
+
+/// F32 dot product, bit-identical to ggml's `ggml_vec_dot_f32` (AVX2 code path) on every platform: four accumulators
+/// of eight lanes take `fma(x, y, acc)` for every 32 values, they are reduced as `(a0 + a2) + (a1 + a3)` and the lanes
+/// with two horizontal adds; the values after the last full group of 32 are added with `fma` one by one.
+pub fn ggml_vec_dot_f32(x: &[f32], y: &[f32]) -> f32 {
+    assert_eq!(x.len(), y.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            // SAFETY: AVX-512F, F16C and FMA are available; the lengths are equal.
+            return unsafe { ggml_vec_dot_f32_avx512(x, y) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the AArch64 baseline; the lengths are equal.
+        return unsafe { ggml_vec_dot_f32_neon(x, y) };
+    }
+    #[allow(unreachable_code)]
+    ggml_vec_dot_f32_scalar(x, y)
+}
+
+/// The definition of [`ggml_vec_dot_f32`] (portable code, the same order of operations).
+pub fn ggml_vec_dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
+    assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let np = n & !31;
+    let mut acc = [[0.0f32; 8]; 4];
+    for i in (0..np).step_by(32) {
+        for (j, a) in acc.iter_mut().enumerate() {
+            for (l, lane) in a.iter_mut().enumerate() {
+                let k = i + 8 * j + l;
+                *lane = x[k].mul_add(y[k], *lane);
+            }
+        }
+    }
+    let mut a = [0.0f32; 8];
+    for l in 0..8 {
+        a[l] = (acc[0][l] + acc[2][l]) + (acc[1][l] + acc[3][l]);
+    }
+    let mut sum = hadd_reduce8(&a);
+    for k in np..n {
+        sum = x[k].mul_add(y[k], sum);
+    }
+    sum
+}
+
+/// BF16 bits to f32.
+#[inline]
+pub fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+/// f32 to BF16 bits with round to nearest even, as ggml's `ggml_compute_fp32_to_bf16` (NaN made quiet).
+#[inline]
+pub fn f32_to_bf16(f: f32) -> u16 {
+    let u = f.to_bits();
+    if (u & 0x7fff_ffff) > 0x7f80_0000 {
+        return ((u >> 16) | 64) as u16;
+    }
+    ((u + (0x7fff + ((u >> 16) & 1))) >> 16) as u16
+}
+
+/// BF16 dot product, bit-identical to ggml's `ggml_vec_dot_bf16` (AVX2 code path): four accumulators of eight lanes
+/// take `acc + x*y` (multiply and add rounded separately) for every 32 values, are reduced as `(a0 + a2) + (a1 + a3)`
+/// and `((l0+l4) + (l2+l6)) + ((l1+l5) + (l3+l7))`; the rest is added in double precision.
+pub fn ggml_vec_dot_bf16(x: &[u16], y: &[u16]) -> f32 {
+    assert_eq!(x.len(), y.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            // SAFETY: AVX-512F, F16C and FMA are available; the lengths are equal.
+            return unsafe { ggml_vec_dot_bf16_avx512(x, y) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the AArch64 baseline; the lengths are equal.
+        return unsafe { ggml_vec_dot_bf16_neon(x, y) };
+    }
+    #[allow(unreachable_code)]
+    ggml_vec_dot_bf16_scalar(x, y)
+}
+
+/// The definition of [`ggml_vec_dot_bf16`] (portable code, the same order of operations).
+pub fn ggml_vec_dot_bf16_scalar(x: &[u16], y: &[u16]) -> f32 {
+    assert_eq!(x.len(), y.len());
+    let n = x.len();
+    let mut acc = [[0.0f32; 8]; 4];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (j, a) in acc.iter_mut().enumerate() {
+            for (l, lane) in a.iter_mut().enumerate() {
+                let k = i + 8 * j + l;
+                *lane += bf16_to_f32(x[k]) * bf16_to_f32(y[k]);
+            }
+        }
+        i += 32;
+    }
+    let mut a = [0.0f32; 8];
+    for l in 0..8 {
+        a[l] = (acc[0][l] + acc[2][l]) + (acc[1][l] + acc[3][l]);
+    }
+    let g = [a[4] + a[0], a[5] + a[1], a[6] + a[2], a[7] + a[3]];
+    let mut sum = ((g[0] + g[2]) + (g[1] + g[3])) as f64;
+    for k in i..n {
+        sum += (bf16_to_f32(x[k]) * bf16_to_f32(y[k])) as f64;
+    }
+    sum as f32
+}
+
+/// `1 / (1 + e^-x)`, as ggml's `ggml_vec_sigmoid_f32` (libm `expf`).
+#[inline]
+pub fn sigmoid_f32(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// `ln(1 + e^x)` with ggml's cut-off (`x` itself above 20), as ggml's `ggml_softplus` (`log1pf(expf(x))`).
+#[inline]
+pub fn softplus_f32(x: f32) -> f32 {
+    if x > 20.0 { x } else { log1p_f32(x.exp()) }
+}
+
+/// `ln(1 + x)` rounded like the C library the reference runtime is linked against.
+///
+/// On Windows this is the platform's `log1pf` (UCRT), which the Windows references were captured with. Everywhere
+/// else it is [`log1p_f32_glibc`], which reproduces glibc's `log1pf` on x86-64 bit for bit. glibc's own `log1pf` on
+/// AArch64 compiles the same C source with fused multiply-adds and rounds a large share of all inputs differently, so
+/// calling the platform function there would break parity with the Linux x86-64 references.
+#[inline]
+pub fn log1p_f32(x: f32) -> f32 {
+    #[cfg(windows)]
+    {
+        x.ln_1p()
+    }
+    #[cfg(not(windows))]
+    {
+        log1p_f32_glibc(x)
+    }
+}
+
+/// Port of glibc's `log1pf` (`sysdeps/ieee754/flt-32/s_log1pf.c`, the fdlibm algorithm by Sun Microsystems), evaluated
+/// in single precision without fused multiply-adds, as glibc's x86-64 build does. Equal to x86-64 glibc 2.39 for every
+/// `f32` input (NaN payloads aside).
+pub fn log1p_f32_glibc(x: f32) -> f32 {
+    const LN2_HI: f32 = f32::from_bits(0x3f31_7180);
+    const LN2_LO: f32 = f32::from_bits(0x3717_f7d1);
+    const LP: [f32; 7] = [
+        f32::from_bits(0x3F2A_AAAB),
+        f32::from_bits(0x3ECC_CCCD),
+        f32::from_bits(0x3E92_4925),
+        f32::from_bits(0x3E63_8E29),
+        f32::from_bits(0x3E3A_3325),
+        f32::from_bits(0x3E1C_D04F),
+        f32::from_bits(0x3E17_8897),
+    ];
+    let hx = x.to_bits() as i32;
+    let ax = hx & 0x7fff_ffff;
+    let mut k = 1i32;
+    let mut f = 0.0f32;
+    let mut hu = 0i32;
+    let mut c = 0.0f32;
+    if hx < 0x3ed4_13d7 {
+        // x < 0.41422
+        if ax >= 0x3f80_0000 {
+            // x <= -1
+            return if x == -1.0 { f32::NEG_INFINITY } else { f32::NAN };
+        }
+        if ax < 0x3100_0000 {
+            // |x| < 2^-29
+            if ax < 0x2480_0000 {
+                return x;
+            }
+            return x - x * x * 0.5;
+        }
+        if hx > 0 || hx <= 0xbe95_f61f_u32 as i32 {
+            // -0.2929 < x < 0.41422
+            k = 0;
+            f = x;
+            hu = 1;
+        }
+    }
+    if hx >= 0x7f80_0000 {
+        return x + x;
+    }
+    if k != 0 {
+        let mut u;
+        if hx < 0x5a00_0000 {
+            u = 1.0f32 + x;
+            hu = u.to_bits() as i32;
+            k = (hu >> 23) - 127;
+            // Correction term.
+            c = if k > 0 { 1.0 - (u - x) } else { x - (u - 1.0) };
+            c /= u;
+        } else {
+            u = x;
+            hu = u.to_bits() as i32;
+            k = (hu >> 23) - 127;
+            c = 0.0;
+        }
+        hu &= 0x007f_ffff;
+        if hu < 0x0035_04f7 {
+            u = f32::from_bits((hu | 0x3f80_0000) as u32); // normalize u
+        } else {
+            k += 1;
+            u = f32::from_bits((hu | 0x3f00_0000) as u32); // normalize u / 2
+            hu = (0x0080_0000 - hu) >> 2;
+        }
+        f = u - 1.0;
+    }
+    let hfsq = 0.5f32 * f * f;
+    let kf = k as f32;
+    if hu == 0 {
+        // |f| < 2^-20
+        if f == 0.0 {
+            if k == 0 {
+                return 0.0;
+            }
+            c += kf * LN2_LO;
+            return kf * LN2_HI + c;
+        }
+        let r = hfsq * (1.0 - 0.666_666_7_f32 * f);
+        if k == 0 {
+            return f - r;
+        }
+        return kf * LN2_HI - ((r - (kf * LN2_LO + c)) - f);
+    }
+    let s = f / (2.0 + f);
+    let z = s * s;
+    let r = z * (LP[0] + z * (LP[1] + z * (LP[2] + z * (LP[3] + z * (LP[4] + z * (LP[5] + z * LP[6]))))));
+    if k == 0 {
+        f - (hfsq - s * (hfsq + r))
+    } else {
+        kf * LN2_HI - ((hfsq - (s * (hfsq + r) + (kf * LN2_LO + c))) - f)
+    }
+}
+
+/// Normalized Walsh-Hadamard transform of every block of `block` consecutive values of `x`, in place, exactly like
+/// ggml's `ggml_compute_forward_fwht`: the values are scaled by `1 / sqrt(block)` first, then the butterflies
+/// `(u + v, u - v)` run with growing stride.
+pub fn fwht_blocks(x: &mut [f32], block: usize) {
+    assert!(block.is_power_of_two() && x.len().is_multiple_of(block));
+    #[cfg(target_arch = "x86_64")]
+    {
+        if block >= 16 && has_avx512f() {
+            // SAFETY: AVX-512F is available; `block` is a power of two of at least 16 that divides `x.len()`.
+            return unsafe { fwht_blocks_avx512(x, block) };
+        }
+    }
+    fwht_blocks_scalar(x, block)
+}
+
+/// The definition of [`fwht_blocks`] (portable code). Every output of a butterfly stage depends only on two values
+/// of the previous stage, so any vector schedule of the same stages gives the same bits.
+pub fn fwht_blocks_scalar(x: &mut [f32], block: usize) {
+    assert!(block.is_power_of_two() && x.len().is_multiple_of(block));
+    let scale = 1.0 / (block as f32).sqrt();
+    for row in x.chunks_exact_mut(block) {
+        for v in row.iter_mut() {
+            *v *= scale;
+        }
+        let mut len = 1;
+        while len < block {
+            for i in (0..block).step_by(2 * len) {
+                for j in i..i + len {
+                    let (u, v) = (row[j], row[j + len]);
+                    row[j] = u + v;
+                    row[j + len] = u - v;
+                }
+            }
+            len <<= 1;
+        }
+    }
+}
+
+/// Quantizes `x` in blocks of 32 values to int8 codes and one scale per block, exactly like ggml's
+/// `quantize_row_q8_0` (AVX2 code path): `amax` of the block, the stored scale `d = fp16(amax / 127)` (returned
+/// here as the f32 value of that half), and the codes `round_half_even(x * (127 / amax))`.
+///
+/// `x.len()` must be a multiple of 32; `qs` has `x.len()` and `d` `x.len() / 32` entries.
+pub fn quantize_q8_0(x: &[f32], qs: &mut [i8], d: &mut [f32]) {
+    assert!(x.len().is_multiple_of(32), "Q8_0 quantization needs whole blocks of 32 values");
+    assert_eq!(qs.len(), x.len());
+    assert_eq!(d.len(), x.len() / 32);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            // SAFETY: AVX-512F and F16C are available; the lengths were checked above.
+            return unsafe { quantize_q8_0_avx512(x, qs, d) };
+        }
+    }
+    quantize_q8_0_scalar(x, qs, d)
+}
+
+/// The definition of [`quantize_q8_0`] (portable code). NaN values are ignored by `amax` and give the code 0.
+pub fn quantize_q8_0_scalar(x: &[f32], qs: &mut [i8], d: &mut [f32]) {
+    assert!(x.len().is_multiple_of(32), "Q8_0 quantization needs whole blocks of 32 values");
+    assert_eq!(qs.len(), x.len());
+    assert_eq!(d.len(), x.len() / 32);
+    for ((xb, qb), db) in x.chunks_exact(32).zip(qs.chunks_exact_mut(32)).zip(d.iter_mut()) {
+        let amax = xb.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        *db = f16_to_f32(f32_to_f16(amax / 127.0));
+        let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+        for (q, &v) in qb.iter_mut().zip(xb) {
+            *q = ((v * id).round_ties_even() as i32).clamp(-128, 127) as i8;
+        }
     }
 }
 
@@ -986,6 +1395,135 @@ fn f32_to_f16_neon(f: f32) -> u16 {
     }
 }
 
+/// Stores the two halves of an eight-lane accumulator.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store8(lo: float32x4_t, hi: float32x4_t) -> [f32; 8] {
+    let mut a = [0.0f32; 8];
+    unsafe {
+        vst1q_f32(a.as_mut_ptr(), lo);
+        vst1q_f32(a.as_mut_ptr().add(4), hi);
+    }
+    a
+}
+
+/// NEON [`ggml_vec_dot_f32_scalar`]: each of the four eight-lane accumulators is a pair of `float32x4_t`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn ggml_vec_dot_f32_neon(x: &[f32], y: &[f32]) -> f32 {
+    let n = x.len();
+    let np = n & !31;
+    let (px, py) = (x.as_ptr(), y.as_ptr());
+    let mut acc = [vdupq_n_f32(0.0); 8];
+    let mut i = 0;
+    while i < np {
+        for (k, a) in acc.iter_mut().enumerate() {
+            *a = vfmaq_f32(*a, vld1q_f32(px.add(i + 4 * k)), vld1q_f32(py.add(i + 4 * k)));
+        }
+        i += 32;
+    }
+    let lo = vaddq_f32(vaddq_f32(acc[0], acc[4]), vaddq_f32(acc[2], acc[6]));
+    let hi = vaddq_f32(vaddq_f32(acc[1], acc[5]), vaddq_f32(acc[3], acc[7]));
+    let mut sum = hadd_reduce8(&store8(lo, hi));
+    for k in np..n {
+        sum = x[k].mul_add(y[k], sum);
+    }
+    sum
+}
+
+/// Eight BF16 values to two `float32x4_t` (exact: the bits move to the upper half).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bf16x8_to_f32(p: *const u16) -> (float32x4_t, float32x4_t) {
+    let v = vld1q_u16(p);
+    (
+        vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(v))),
+        vreinterpretq_f32_u32(vshll_high_n_u16::<16>(v)),
+    )
+}
+
+/// NEON [`ggml_vec_dot_bf16_scalar`]: multiply and add rounded separately, as in the reference.
+#[cfg(target_arch = "aarch64")]
+unsafe fn ggml_vec_dot_bf16_neon(x: &[u16], y: &[u16]) -> f32 {
+    let n = x.len();
+    let (px, py) = (x.as_ptr(), y.as_ptr());
+    let mut acc = [vdupq_n_f32(0.0); 8];
+    let mut i = 0;
+    while i + 32 <= n {
+        for j in 0..4 {
+            let (xl, xh) = bf16x8_to_f32(px.add(i + 8 * j));
+            let (yl, yh) = bf16x8_to_f32(py.add(i + 8 * j));
+            acc[2 * j] = vaddq_f32(acc[2 * j], vmulq_f32(xl, yl));
+            acc[2 * j + 1] = vaddq_f32(acc[2 * j + 1], vmulq_f32(xh, yh));
+        }
+        i += 32;
+    }
+    let lo = vaddq_f32(vaddq_f32(acc[0], acc[4]), vaddq_f32(acc[2], acc[6]));
+    let hi = vaddq_f32(vaddq_f32(acc[1], acc[5]), vaddq_f32(acc[3], acc[7]));
+    let a = store8(lo, hi);
+    let g = [a[4] + a[0], a[5] + a[1], a[6] + a[2], a[7] + a[3]];
+    let mut sum = ((g[0] + g[2]) + (g[1] + g[3])) as f64;
+    for k in i..n {
+        sum += (bf16_to_f32(x[k]) * bf16_to_f32(y[k])) as f64;
+    }
+    sum as f32
+}
+
+/// NEON [`ggml_vec_dot_f16_f32_scalar`]: hardware half conversion (exact) and the same fused multiply-adds.
+#[cfg(target_arch = "aarch64")]
+unsafe fn ggml_vec_dot_f16_f32_neon(x: &[u16], y: &[f32]) -> f32 {
+    let n = x.len();
+    let (px, py) = (x.as_ptr(), y.as_ptr());
+    let mut acc = [vdupq_n_f32(0.0); 8];
+    let mut i = 0;
+    while i + 32 <= n {
+        for (k, a) in acc.iter_mut().enumerate() {
+            *a = vfmaq_f32(*a, cvt_f16x4_to_f32x4(vld1_u16(px.add(i + 4 * k))), vld1q_f32(py.add(i + 4 * k)));
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        acc[0] = vfmaq_f32(acc[0], cvt_f16x4_to_f32x4(vld1_u16(px.add(i))), vld1q_f32(py.add(i)));
+        acc[1] = vfmaq_f32(acc[1], cvt_f16x4_to_f32x4(vld1_u16(px.add(i + 4))), vld1q_f32(py.add(i + 4)));
+        i += 8;
+    }
+    let lo = vaddq_f32(vaddq_f32(acc[0], acc[2]), vaddq_f32(acc[4], acc[6]));
+    let hi = vaddq_f32(vaddq_f32(acc[1], acc[3]), vaddq_f32(acc[5], acc[7]));
+    let a = store8(lo, hi);
+    let r = [a[0] + a[4], a[1] + a[5], a[2] + a[6], a[3] + a[7]];
+    let mut sum = ((r[0] + r[2]) + (r[1] + r[3])) as f64;
+    for k in i..n {
+        sum += (f16_to_f32(x[k]) * y[k]) as f64;
+    }
+    sum as f32
+}
+
+/// `acc[i] = fma(f16(v[i]), s, acc[i])`, the value accumulation of upstream llama.cpp's flash attention
+/// (`ggml_vec_mad_f16_f32`); element-wise, so every vector width gives the same bits.
+pub fn ggml_vec_mad_f16_f32(acc: &mut [f32], v: &[u16], s: f32) {
+    assert_eq!(acc.len(), v.len());
+    #[allow(unused_mut)]
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512f() {
+            // SAFETY: AVX-512F, F16C and FMA are available; the lengths are equal.
+            i = unsafe { ggml_vec_mad_f16_f32_avx512(acc, v, s) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let sv = vdupq_n_f32(s);
+        while i + 4 <= acc.len() {
+            let p = acc.as_mut_ptr().add(i);
+            vst1q_f32(p, vfmaq_f32(vld1q_f32(p), cvt_f16x4_to_f32x4(vld1_u16(v.as_ptr().add(i))), sv));
+            i += 4;
+        }
+    }
+    for k in i..acc.len() {
+        acc[k] = f16_to_f32(v[k]).mul_add(s, acc[k]);
+    }
+}
+
 /// NEON `expf` of ggml (`ggml_v_expf`), the same polynomial and the same fused operations as [`ggml_v_expf_avx2`].
 #[cfg(target_arch = "aarch64")]
 #[inline]
@@ -1206,6 +1744,223 @@ unsafe fn ggml_vec_scale_f16_neon(y: &mut [u16], v: f32) {
     }
 }
 
+// ============================================================================
+// AVX-512 paths of the primitives of the llama.cpp-format models
+// ============================================================================
+//
+// The definitions above follow ggml's AVX2 code: four accumulators of eight lanes per group of 32 values. A 512-bit
+// register holds two of them, so `[acc0 | acc1]` and `[acc2 | acc3]` take exactly the per-lane operations of the
+// definition, and the reductions combine the halves in the definition's order.
+
+/// Whether the AVX-512 paths below can run (AVX-512F, plus F16C and FMA for the 256-bit tails).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn has_avx512f() -> bool {
+    is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma")
+}
+
+/// The upper eight lanes of a 512-bit register.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn hi256(v: __m512) -> __m256 {
+    _mm256_castpd_ps(_mm512_extractf64x4_pd::<1>(_mm512_castps_pd(v)))
+}
+
+/// Sixteen F16 values to F32.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load_f16x16(p: *const u16) -> __m512 {
+    _mm512_cvtph_ps(_mm256_loadu_si256(p as *const __m256i))
+}
+
+/// Sixteen BF16 values to F32.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load_bf16x16(p: *const u16) -> __m512 {
+    _mm512_castsi512_ps(_mm512_slli_epi32::<16>(_mm512_cvtepu16_epi32(_mm256_loadu_si256(p as *const __m256i))))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn store8(v: __m256) -> [f32; 8] {
+    let mut l = [0.0f32; 8];
+    _mm256_storeu_ps(l.as_mut_ptr(), v);
+    l
+}
+
+/// AVX-512 [`ggml_vec_dot_f32`] (the same operations as [`ggml_vec_dot_f32_scalar`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+unsafe fn ggml_vec_dot_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
+    let n = x.len();
+    let np = n & !31;
+    let (px, py) = (x.as_ptr(), y.as_ptr());
+    let (mut a, mut b) = (_mm512_setzero_ps(), _mm512_setzero_ps());
+    let mut i = 0;
+    while i < np {
+        a = _mm512_fmadd_ps(_mm512_loadu_ps(px.add(i)), _mm512_loadu_ps(py.add(i)), a);
+        b = _mm512_fmadd_ps(_mm512_loadu_ps(px.add(i + 16)), _mm512_loadu_ps(py.add(i + 16)), b);
+        i += 32;
+    }
+    // [acc0 + acc2 | acc1 + acc3], then (acc0 + acc2) + (acc1 + acc3).
+    let c = _mm512_add_ps(a, b);
+    let l = store8(_mm256_add_ps(_mm512_castps512_ps256(c), hi256(c)));
+    let mut sum = hadd_reduce8(&l);
+    for k in np..n {
+        sum = x[k].mul_add(y[k], sum);
+    }
+    sum
+}
+
+/// AVX-512 [`ggml_vec_dot_bf16`] (the same operations as [`ggml_vec_dot_bf16_scalar`]: multiply and add rounded
+/// separately).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+unsafe fn ggml_vec_dot_bf16_avx512(x: &[u16], y: &[u16]) -> f32 {
+    let n = x.len();
+    let (px, py) = (x.as_ptr(), y.as_ptr());
+    let (mut a, mut b) = (_mm512_setzero_ps(), _mm512_setzero_ps());
+    let mut i = 0;
+    while i + 32 <= n {
+        a = _mm512_add_ps(a, _mm512_mul_ps(load_bf16x16(px.add(i)), load_bf16x16(py.add(i))));
+        b = _mm512_add_ps(b, _mm512_mul_ps(load_bf16x16(px.add(i + 16)), load_bf16x16(py.add(i + 16))));
+        i += 32;
+    }
+    let c = _mm512_add_ps(a, b);
+    let a = store8(_mm256_add_ps(_mm512_castps512_ps256(c), hi256(c)));
+    let g = [a[4] + a[0], a[5] + a[1], a[6] + a[2], a[7] + a[3]];
+    let mut sum = ((g[0] + g[2]) + (g[1] + g[3])) as f64;
+    for k in i..n {
+        sum += (bf16_to_f32(x[k]) * bf16_to_f32(y[k])) as f64;
+    }
+    sum as f32
+}
+
+/// AVX-512 [`ggml_vec_dot_f16_f32`] (the same operations as [`ggml_vec_dot_f16_f32_scalar`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+unsafe fn ggml_vec_dot_f16_f32_avx512(x: &[u16], y: &[f32]) -> f32 {
+    let n = x.len();
+    let (px, py) = (x.as_ptr(), y.as_ptr());
+    let (mut a, mut b) = (_mm512_setzero_ps(), _mm512_setzero_ps());
+    let mut i = 0;
+    while i + 32 <= n {
+        a = _mm512_fmadd_ps(load_f16x16(px.add(i)), _mm512_loadu_ps(py.add(i)), a);
+        b = _mm512_fmadd_ps(load_f16x16(px.add(i + 16)), _mm512_loadu_ps(py.add(i + 16)), b);
+        i += 32;
+    }
+    let mut acc0 = _mm512_castps512_ps256(a);
+    while i + 8 <= n {
+        let xv = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i) as *const __m128i));
+        acc0 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(py.add(i)), acc0);
+        i += 8;
+    }
+    // (acc0 + acc1) + (acc2 + acc3).
+    let s01 = _mm256_add_ps(acc0, hi256(a));
+    let s23 = _mm256_add_ps(_mm512_castps512_ps256(b), hi256(b));
+    let l = store8(_mm256_add_ps(s01, s23));
+    let r = [l[0] + l[4], l[1] + l[5], l[2] + l[6], l[3] + l[7]];
+    let mut sum = ((r[0] + r[2]) + (r[1] + r[3])) as f64;
+    for k in i..n {
+        sum += (f16_to_f32(x[k]) * y[k]) as f64;
+    }
+    sum as f32
+}
+
+/// AVX-512 [`quantize_q8_0`] (the same results as [`quantize_q8_0_scalar`]): `amax` with NaN lanes set to zero (the
+/// scalar `f32::max` ignores NaN, and the maximum is exact in any order), the scale through the F16C conversions,
+/// the codes as `x * id` clamped to `[-128, 127]` and rounded to nearest even (clamping first gives the same code as
+/// rounding first), NaN products give 0 like the scalar `as i32`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+unsafe fn quantize_q8_0_avx512(x: &[f32], qs: &mut [i8], d: &mut [f32]) {
+    for (b, db) in d.iter_mut().enumerate() {
+        let p = x.as_ptr().add(32 * b);
+        let (v0, v1) = (_mm512_loadu_ps(p), _mm512_loadu_ps(p.add(16)));
+        let amax = _mm512_reduce_max_ps(_mm512_max_ps(abs_or_zero(v0), abs_or_zero(v1)));
+        let h = _mm_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm_set_ss(amax / 127.0));
+        *db = _mm_cvtss_f32(_mm_cvtph_ps(h));
+        let id = _mm512_set1_ps(if amax != 0.0 { 127.0 / amax } else { 0.0 });
+        let o = qs.as_mut_ptr().add(32 * b);
+        _mm_storeu_si128(o as *mut __m128i, q8_codes(v0, id));
+        _mm_storeu_si128(o.add(16) as *mut __m128i, q8_codes(v1, id));
+    }
+}
+
+/// `|v|`, with NaN lanes set to zero.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn abs_or_zero(v: __m512) -> __m512 {
+    let a = _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(v), _mm512_set1_epi32(0x7fff_ffff)));
+    _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(v, v), a)
+}
+
+/// The sixteen `Q8_0` codes of `v * id`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn q8_codes(v: __m512, id: __m512) -> __m128i {
+    let m = _mm512_mul_ps(v, id);
+    let c = _mm512_min_ps(_mm512_max_ps(m, _mm512_set1_ps(-128.0)), _mm512_set1_ps(127.0));
+    let k = _mm512_maskz_cvt_roundps_epi32::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+        _mm512_cmp_ps_mask::<_CMP_ORD_Q>(m, m),
+        c,
+    );
+    _mm512_cvtepi32_epi8(k)
+}
+
+/// One butterfly stage of stride `L < 16` inside a 512-bit register: `sw` holds the partners (lane `j ^ L`), the
+/// lanes with bit `L` clear take `u + v`, the others `u - v` (`MASK` marks them).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn fwht_stage16<const MASK: u16>(v: __m512, sw: __m512) -> __m512 {
+    _mm512_mask_sub_ps(_mm512_add_ps(v, sw), MASK, sw, v)
+}
+
+/// AVX-512 [`fwht_blocks`] for `block >= 16` (the same butterflies as [`fwht_blocks_scalar`]): the scaling and the
+/// strides 1, 2, 4 and 8 inside each register of sixteen values, the strides from 16 on between registers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+unsafe fn fwht_blocks_avx512(x: &mut [f32], block: usize) {
+    let scale = _mm512_set1_ps(1.0 / (block as f32).sqrt());
+    for row in x.chunks_exact_mut(block) {
+        let p = row.as_mut_ptr();
+        for i in (0..block).step_by(16) {
+            let mut v = _mm512_mul_ps(_mm512_loadu_ps(p.add(i)), scale);
+            v = fwht_stage16::<0xaaaa>(v, _mm512_permute_ps::<0xb1>(v));
+            v = fwht_stage16::<0xcccc>(v, _mm512_permute_ps::<0x4e>(v));
+            v = fwht_stage16::<0xf0f0>(v, _mm512_shuffle_f32x4::<0xb1>(v, v));
+            v = fwht_stage16::<0xff00>(v, _mm512_shuffle_f32x4::<0x4e>(v, v));
+            _mm512_storeu_ps(p.add(i), v);
+        }
+        let mut len = 16;
+        while len < block {
+            for i in (0..block).step_by(2 * len) {
+                for j in (i..i + len).step_by(16) {
+                    let (u, v) = (_mm512_loadu_ps(p.add(j)), _mm512_loadu_ps(p.add(j + len)));
+                    _mm512_storeu_ps(p.add(j), _mm512_add_ps(u, v));
+                    _mm512_storeu_ps(p.add(j + len), _mm512_sub_ps(u, v));
+                }
+            }
+            len <<= 1;
+        }
+    }
+}
+
+/// AVX-512 part of [`ggml_vec_mad_f16_f32`]: sixteen elements at a time; returns how many were done.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+unsafe fn ggml_vec_mad_f16_f32_avx512(acc: &mut [f32], v: &[u16], s: f32) -> usize {
+    let n = acc.len();
+    let sv = _mm512_set1_ps(s);
+    let mut i = 0;
+    while i + 16 <= n {
+        let p = acc.as_mut_ptr().add(i);
+        _mm512_storeu_ps(p, _mm512_fmadd_ps(load_f16x16(v.as_ptr().add(i)), sv, _mm512_loadu_ps(p)));
+        i += 16;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1421,4 +2176,29 @@ mod tests {
         println!("OPS_CHECKSUM vec_dot_f32_f16 {h_dot:016x}");
         println!("OPS_CHECKSUM vec_mad_f32_f16 {h_madf32:016x}");
     }
+
+    /// The glibc port of `log1pf`: on x86-64 Linux it must equal the C library for a dense sample of all inputs, and its
+    /// checksum over that sample is a constant, so the line is identical on every platform.
+    #[test]
+    fn log1p_port_reproduces_x86_64_glibc() {
+        let mut h = 0xCBF2_9CE4_8422_2325u64;
+        let mut check = |bits: u32| {
+            let x = f32::from_bits(bits);
+            let y = log1p_f32_glibc(x);
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                let want = x.ln_1p();
+                assert!(y.to_bits() == want.to_bits() || (y.is_nan() && want.is_nan()), "log1pf({x:e}): {y:e} vs {want:e}");
+            }
+            fnv(&mut h, if y.is_nan() { 0x7fc0_0000 } else { y.to_bits() as u64 });
+        };
+        // Every 1021st bit pattern, and every 61st input between 1e-3 and 64 (the range softplus feeds).
+        (0..=u32::MAX / 1021).for_each(|i| check(i * 1021));
+        (0x3a83_126f_u32..0x4280_0000).step_by(61).for_each(&mut check);
+        println!("LOG1PF_CHECKSUM {h:016x}");
+        assert_eq!(h, LOG1PF_SAMPLE_CHECKSUM);
+    }
+
+    /// Checksum of [`log1p_port_reproduces_x86_64_glibc`]'s sample, computed on x86-64 Linux (glibc 2.39).
+    const LOG1PF_SAMPLE_CHECKSUM: u64 = 0x1f00_f479_5615_2e02;
 }

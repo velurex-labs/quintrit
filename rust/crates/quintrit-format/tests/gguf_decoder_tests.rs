@@ -649,3 +649,65 @@ fn tq_tensor_with_differing_block_scales_is_rejected() {
         assert!(load_and_transcode_gguf_tensor(&g, "w", rows, cols).is_err(), "type {ty}");
     }
 }
+
+// ----------------------------------------------------------------------------
+// Q2_0 with 64- and 128-weight blocks
+// ----------------------------------------------------------------------------
+
+#[test]
+fn q2_0_block_size_is_detected_from_the_layout() {
+    // A 2 x 2048 matrix whose weights are trit = (i % 3) - 1, with the scale 0.5 (f16 0x3800) everywhere; a tensor this
+    // size differs by 64 bytes between the two block sizes, more than the alignment, so its layout decides.
+    let (cols, n) = (2048usize, 4096usize);
+    let codes: Vec<u8> = (0..n).map(|i| (i % 3) as u8).collect();
+    let pack = |c: &[u8]| -> Vec<u8> { c.chunks(4).map(|q| q[0] | q[1] << 2 | q[2] << 4 | q[3] << 6).collect() };
+    let mut b64 = Vec::new();
+    for blk in codes.chunks(64) {
+        b64.extend([0x00, 0x38]);
+        b64.extend(pack(blk));
+    }
+    let mut b128 = Vec::new();
+    for blk in codes.chunks(128) {
+        b128.extend([0x00, 0x38]);
+        b128.extend(pack(blk));
+    }
+    for (label, payload, block) in [("q2_0_b64", b64, 64usize), ("q2_0_b128", b128, 128)] {
+        let bytes = build_gguf(
+            &[("general.architecture", Kv::Str("qwen3"))],
+            &[
+                TensorSpec { name: "w", shape: vec![cols as u64, 2], tensor_type: GGML_TYPE_Q2_0, payload },
+                TensorSpec { name: "n", shape: vec![4], tensor_type: GGML_TYPE_F32, payload: f32_bytes(&[1.0; 4]) },
+            ],
+            32,
+        );
+        let path = write_temp(label, &bytes);
+        let g = GgufFile::open(&path).unwrap();
+        assert_eq!(g.tensors["w"].block_size, Some(block), "{label}");
+        let data = g.get_tensor_data("w").unwrap();
+        let (trits, scales) = decode_q2_0(data, 2, cols, block).unwrap();
+        assert_eq!(scales, vec![0.5; n / 64], "{label}: one scale per 64 weights");
+        let want: Vec<i8> = (0..n).map(|i| (i % 3) as i8 - 1).collect();
+        assert_eq!(trits, want, "{label}");
+        drop(g);
+        std::fs::remove_file(path).ok();
+    }
+}
+
+#[test]
+fn unread_tensors_lists_the_tensors_nobody_requested() {
+    let bytes = build_gguf(
+        &[("general.architecture", Kv::Str("llama"))],
+        &[
+            TensorSpec { name: "a", shape: vec![4], tensor_type: GGML_TYPE_F32, payload: f32_bytes(&[1.0; 4]) },
+            TensorSpec { name: "b", shape: vec![4], tensor_type: GGML_TYPE_F32, payload: f32_bytes(&[2.0; 4]) },
+        ],
+        32,
+    );
+    let path = write_temp("unread", &bytes);
+    let g = GgufFile::open(&path).unwrap();
+    assert_eq!(g.unread_tensors(), vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(g.get_tensor_f32("b").unwrap(), vec![2.0; 4]);
+    assert_eq!(g.unread_tensors(), vec!["a".to_string()]);
+    drop(g);
+    std::fs::remove_file(path).ok();
+}

@@ -47,7 +47,7 @@ Add `quintrit-core` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-quintrit-core = "0.1"
+quintrit-core = "0.2"
 ```
 
 ### Example Usage

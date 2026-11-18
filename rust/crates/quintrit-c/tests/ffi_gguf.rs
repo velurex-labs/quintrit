@@ -37,7 +37,7 @@ fn layout_of() -> TiledLayout {
 fn open_list_and_read_metadata() {
     let dir = TempDir::new("gguf-list");
     let file = dir.path("m.gguf");
-    let trits = write_model(&file, 1, &Flaws::default());
+    let trits = write_model(&file, 1, &Flaws { extra_tensor: true, ..Default::default() });
     let h = open(&file).unwrap();
 
     let mut info = GgufInfo { struct_size: size_of::<GgufInfo>() as u32, ..Default::default() };
@@ -121,7 +121,7 @@ fn open_list_and_read_metadata() {
 fn convert_ternary_tensors_to_every_layout() {
     let dir = TempDir::new("gguf-convert");
     let file = dir.path("m.gguf");
-    let trits = write_model(&file, 2, &Flaws::default());
+    let trits = write_model(&file, 2, &Flaws { extra_tensor: true, ..Default::default() });
     let h = open(&file).unwrap();
     let mut rng = Rng::new(5);
 
