@@ -7,16 +7,14 @@
 //! one scale per tensor). [`decode_q2_0`] returns the trits together with one scale per 64 weights.
 
 use super::half_to_f32;
+use quintrit_core::pack::PARALLEL_MIN_WEIGHTS;
+use rayon::prelude::*;
 
 /// Weights per block in llama.cpp's definition (`QK2_0`).
 pub const QK2_0: usize = 64;
 
-/// Decodes a `Q2_0` tensor of `rows x cols` weights stored with `block_size` (64 or 128) weights per block.
-///
-/// Returns the trits (`rows * cols`, row-major) and the scales, one per 64 weights (`rows * cols / 64`, row-major; a
-/// 128-weight block contributes its scale twice). Fails if the shape does not fit the data or a weight uses the code 3
-/// (`+2`), which is not ternary.
-pub fn decode_q2_0(data: &[u8], rows: usize, cols: usize, block_size: usize) -> Result<(Vec<i8>, Vec<f32>), String> {
+/// Checks the shape of a `Q2_0` tensor against its payload and returns the number of weights.
+fn check_q2_0(data: &[u8], rows: usize, cols: usize, block_size: usize) -> Result<usize, String> {
     if block_size != 64 && block_size != 128 {
         return Err(format!("Q2_0 block size {block_size} is not supported (64 or 128)"));
     }
@@ -28,25 +26,132 @@ pub fn decode_q2_0(data: &[u8], rows: usize, cols: usize, block_size: usize) -> 
     if data.len() != n / block_size * block_bytes {
         return Err(format!("Q2_0 data of {} bytes does not hold {rows} x {cols} weights", data.len()));
     }
-    let mut trits = vec![0i8; n];
-    let mut scales = Vec::with_capacity(n / QK2_0);
-    for (b, block) in data.chunks_exact(block_bytes).enumerate() {
-        let d = half_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        for _ in 0..block_size / QK2_0 {
-            scales.push(d);
+    Ok(n)
+}
+
+/// Decodes one block (`block_size` weights) into `dst` and its scale(s) into `block_scales`. `first_weight` is the index
+/// of the block's first weight in the tensor; an error names the first offending weight of the block.
+fn decode_block(first_weight: usize, block: &[u8], dst: &mut [i8], block_scales: &mut [f32]) -> Result<(), String> {
+    block_scales.fill(half_to_f32(u16::from_le_bytes([block[0], block[1]])));
+    // Fixed trip counts and no branches in the loop, so that the compiler vectorizes it for the target; the code 3 is
+    // only noted here and located afterwards.
+    let mut invalid = 0u8;
+    for (&byte, out) in block[2..].iter().zip(dst.chunks_exact_mut(4)) {
+        for k in 0..4 {
+            let code = (byte >> (2 * k)) & 3;
+            invalid |= (code == 3) as u8;
+            out[k] = code as i8 - 1;
         }
-        let dst = &mut trits[b * block_size..(b + 1) * block_size];
-        for (j, &byte) in block[2..].iter().enumerate() {
-            for k in 0..4 {
-                let code = (byte >> (2 * k)) & 3;
-                if code == 3 {
-                    return Err(format!("Q2_0 weight {} uses code 3 (+2), which is not ternary", b * block_size + 4 * j + k));
-                }
-                dst[4 * j + k] = code as i8 - 1;
-            }
+    }
+    if invalid != 0 {
+        let bad = block[2..]
+            .iter()
+            .enumerate()
+            .flat_map(|(j, &byte)| (0..4).map(move |k| (4 * j + k, (byte >> (2 * k)) & 3)))
+            .find(|&(_, code)| code == 3);
+        let (offset, _) = bad.expect("a code 3 was seen");
+        return Err(format!("Q2_0 weight {} uses code 3 (+2), which is not ternary", first_weight + offset));
+    }
+    Ok(())
+}
+
+/// Decodes a `Q2_0` tensor of `rows x cols` weights stored with `block_size` (64 or 128) weights per block.
+///
+/// Returns the trits (`rows * cols`, row-major) and the scales, one per 64 weights (`rows * cols / 64`, row-major; a
+/// 128-weight block contributes its scale twice). Fails if the shape does not fit the data or a weight uses the code 3
+/// (`+2`), which is not ternary. A tensor of at least [`PARALLEL_MIN_WEIGHTS`] weights is decoded by all threads of the
+/// global rayon pool; the result and the error (the one of the first offending weight) do not depend on the scheduling.
+pub fn decode_q2_0(data: &[u8], rows: usize, cols: usize, block_size: usize) -> Result<(Vec<i8>, Vec<f32>), String> {
+    let n = check_q2_0(data, rows, cols, block_size)?;
+    let block_bytes = 2 + block_size / 4;
+    let mut trits = vec![0i8; n];
+    let mut scales = vec![0f32; n / QK2_0];
+    let per_block = block_size / QK2_0;
+    if n >= PARALLEL_MIN_WEIGHTS {
+        // `find_first` returns the error of the lowest block.
+        let failed = trits
+            .par_chunks_exact_mut(block_size)
+            .zip(scales.par_chunks_exact_mut(per_block))
+            .zip(data.par_chunks_exact(block_bytes))
+            .enumerate()
+            .map(|(b, ((dst, block_scales), block))| decode_block(b * block_size, block, dst, block_scales))
+            .find_first(|r| r.is_err());
+        if let Some(Err(e)) = failed {
+            return Err(e);
+        }
+    } else {
+        for (b, ((dst, block_scales), block)) in
+            trits.chunks_exact_mut(block_size).zip(scales.chunks_exact_mut(per_block)).zip(data.chunks_exact(block_bytes)).enumerate()
+        {
+            decode_block(b * block_size, block, dst, block_scales)?;
         }
     }
     Ok((trits, scales))
+}
+
+/// Rows decoded and packed together by [`decode_q2_0_packed`]: the trits of such a group (`8 * cols` bytes) stay in the
+/// cache of the thread that converts it.
+const PACKED_GROUP_ROWS: usize = 8;
+
+/// Decodes a `Q2_0` tensor like [`decode_q2_0`], but returns the weights already packed into the 5-planar layout of
+/// [`quintrit_core::pack::pack_matrix`] (`rows * cols.div_ceil(160) * 32` bytes) instead of one byte per trit.
+///
+/// The conversion runs in groups of rows on all threads of the global rayon pool, each through a small buffer that is
+/// reused, so the large intermediate array of trits is never materialized. The packed bytes and the scales are exactly
+/// those of `pack_matrix(decode_q2_0(..).0)` and `decode_q2_0(..).1`.
+pub fn decode_q2_0_packed(data: &[u8], rows: usize, cols: usize, block_size: usize) -> Result<(Vec<u8>, Vec<f32>), String> {
+    use quintrit_core::pack::{pack_matrix_into, BLOCK_BYTES_5, QK_5};
+    let n = check_q2_0(data, rows, cols, block_size)?;
+    let block_bytes = 2 + block_size / 4;
+    let row_bytes = cols / block_size * block_bytes;
+    let packed_row_bytes = cols.div_ceil(QK_5) * BLOCK_BYTES_5;
+    let mut packed = vec![0u8; rows * packed_row_bytes];
+    let mut scales = vec![0f32; n / QK2_0];
+    if rows == 0 {
+        return Ok((packed, scales));
+    }
+    let per_block = block_size / QK2_0;
+    let scales_per_row = cols / QK2_0;
+
+    let convert = |trits: &mut Vec<i8>, g: usize, data: &[u8], packed: &mut [u8], scales: &mut [f32]| -> Result<(), String> {
+        let group_rows = data.len() / row_bytes;
+        trits.resize(group_rows * cols, 0);
+        let first_weight = g * PACKED_GROUP_ROWS * cols;
+        for (b, ((dst, block_scales), block)) in trits
+            .chunks_exact_mut(block_size)
+            .zip(scales.chunks_exact_mut(per_block))
+            .zip(data.chunks_exact(block_bytes))
+            .enumerate()
+        {
+            decode_block(first_weight + b * block_size, block, dst, block_scales)?;
+        }
+        pack_matrix_into(trits, group_rows, cols, packed);
+        Ok(())
+    };
+
+    if n >= PARALLEL_MIN_WEIGHTS {
+        // `find_first` returns the error of the lowest group, so the message does not depend on the scheduling.
+        let failed = data
+            .par_chunks(PACKED_GROUP_ROWS * row_bytes)
+            .zip(packed.par_chunks_mut(PACKED_GROUP_ROWS * packed_row_bytes))
+            .zip(scales.par_chunks_mut(PACKED_GROUP_ROWS * scales_per_row))
+            .enumerate()
+            .map_init(Vec::new, |trits, (g, ((data, packed), scales))| convert(trits, g, data, packed, scales))
+            .find_first(|r| r.is_err());
+        if let Some(Err(e)) = failed {
+            return Err(e);
+        }
+    } else {
+        let mut trits = Vec::new();
+        let groups = data
+            .chunks(PACKED_GROUP_ROWS * row_bytes)
+            .zip(packed.chunks_mut(PACKED_GROUP_ROWS * packed_row_bytes))
+            .zip(scales.chunks_mut(PACKED_GROUP_ROWS * scales_per_row));
+        for (g, ((data, packed), scales)) in groups.enumerate() {
+            convert(&mut trits, g, data, packed, scales)?;
+        }
+    }
+    Ok((packed, scales))
 }
 
 #[cfg(test)]

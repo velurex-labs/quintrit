@@ -1067,10 +1067,8 @@ impl Loader<'_> {
         let weights = match info.tensor_type {
             GGML_TYPE_Q2_0 => {
                 let block = info.block_size.ok_or_else(|| format!("{name}: unknown Q2_0 block size"))?;
-                let (trits, scales) = quintrit_format::decode_q2_0(data, rows, cols, block).map_err(|e| format!("{name}: {e}"))?;
-                Weights::Ternary(LinearLayer::BlockScaled(crate::layer::BlockScaledLayer::new(
-                    &trits, scales, rows, cols, self.threads,
-                )?))
+                let layer = crate::layer::BlockScaledLayer::from_q2_0(data, rows, cols, block, self.threads).map_err(|e| format!("{name}: {e}"))?;
+                Weights::Ternary(LinearLayer::BlockScaled(layer))
             }
             GGML_TYPE_F32 => Weights::F32(data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
             GGML_TYPE_BF16 => Weights::Bf16(data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()),
@@ -1117,9 +1115,8 @@ impl Loader<'_> {
         let per = data.len() / n;
         (0..n)
             .map(|e| {
-                let (trits, scales) =
-                    quintrit_format::decode_q2_0(&data[e * per..(e + 1) * per], rows, cols, block).map_err(|err| format!("{name}[{e}]: {err}"))?;
-                let layer = crate::layer::BlockScaledLayer::new(&trits, scales, rows, cols, self.threads)?;
+                let layer = crate::layer::BlockScaledLayer::from_q2_0(&data[e * per..(e + 1) * per], rows, cols, block, self.threads)
+                    .map_err(|err| format!("{name}[{e}]: {err}"))?;
                 Ok(Proj { weights: Weights::Ternary(LinearLayer::BlockScaled(layer)), rows, cols, hadamard: None })
             })
             .collect()

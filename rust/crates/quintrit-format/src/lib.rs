@@ -20,7 +20,7 @@ pub mod gguf;
 pub mod transcoder;
 
 pub use decoders::{
-    decode_q2_0, get_ternary_decoder, is_supported_ternary_type, supported_ternary_formats, uniform_block_scale,
+    decode_q2_0, decode_q2_0_packed, get_ternary_decoder, is_supported_ternary_type, supported_ternary_formats, uniform_block_scale,
     I2sDecoder,
     TernaryDecoder, Tq1_0Decoder, Tq2_0Decoder, I2_S_DECODER, TQ1_0_DECODER, TQ2_0_DECODER,
 };
@@ -31,7 +31,7 @@ pub use gguf::{
 };
 
 pub use transcoder::{
-    load_and_transcode_gguf_tensor, transcode_gguf_i2_s_to_velurex_tiled,
+    transcode_to_tiled, load_and_transcode_gguf_tensor, transcode_gguf_i2_s_to_velurex_tiled,
     transcode_trits_to_velurex_tiled, verify_transcoded_parity, TranscodedTernaryMatrix,
 };
 

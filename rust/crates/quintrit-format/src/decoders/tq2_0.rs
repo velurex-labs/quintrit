@@ -7,8 +7,9 @@
 
 use super::TernaryDecoder;
 use crate::gguf::GGML_TYPE_TQ2_0;
-use quintrit_core::lut::transform_weights_lut;
-use quintrit_core::pack::pack_matrix;
+use quintrit_core::pack::PARALLEL_MIN_WEIGHTS;
+use quintrit_core::unpack::{decode_2bit_planes, PlaneOrder};
+use rayon::prelude::*;
 
 /// Block size in number of weights.
 pub const QK_TQ2_0: usize = 256;
@@ -34,7 +35,17 @@ impl TernaryDecoder for Tq2_0Decoder {
         2.0625
     }
 
+    fn row_bytes(&self, cols: usize) -> Option<usize> {
+        cols.is_multiple_of(QK_TQ2_0).then_some(cols / QK_TQ2_0 * BLOCK_BYTES_TQ2_0)
+    }
+
     fn unpack_trits(&self, data: &[u8], rows: usize, cols: usize) -> Result<Vec<i8>, String> {
+        let mut trits = vec![0i8; rows * cols];
+        self.unpack_trits_into(data, rows, cols, &mut trits)?;
+        Ok(trits)
+    }
+
+    fn unpack_trits_into(&self, data: &[u8], rows: usize, cols: usize, out_trits: &mut [i8]) -> Result<(), String> {
         let total_weights = rows * cols;
         if total_weights % QK_TQ2_0 != 0 {
             return Err(format!(
@@ -52,36 +63,31 @@ impl TernaryDecoder for Tq2_0Decoder {
             ));
         }
 
-        let mut out_trits = vec![0i8; total_weights];
+        if out_trits.len() != total_weights {
+            return Err(format!("output buffer holds {} trits, expected {}", out_trits.len(), total_weights));
+        }
 
         // Element order of ggml `dequantize_row_tq2_0`: for each group of 32 bytes, the four 2-bit
         // planes are emitted one after another, i.e. element `l * 32 + m` of a group comes from bits
         // `2l..2l+1` of byte `m`.
-        for b in 0..num_blocks {
-            let block_offset = b * BLOCK_BYTES_TQ2_0;
-            let qs = &data[block_offset..block_offset + 64];
-            let mut out = b * QK_TQ2_0;
-            for j in (0..64).step_by(32) {
-                for l in 0..4 {
-                    for m in 0..32 {
-                        let code = (qs[j + m] >> (l * 2)) & 0x03;
-                        out_trits[out] = match code {
-                            0 => -1,
-                            2 => 1,
-                            _ => 0, // 1 is zero; the unused code 3 decodes to zero
-                        };
-                        out += 1;
-                    }
-                }
+        // Two groups of 32 bytes with plane 0 in the low bits; 1 is zero and the unused code 3 decodes to zero.
+        let decode_block = |block: &[u8], out_block: &mut [i8]| decode_2bit_planes(&block[..64], out_block, PlaneOrder::LowFirst);
+
+        if total_weights >= PARALLEL_MIN_WEIGHTS {
+            out_trits
+                .par_chunks_exact_mut(QK_TQ2_0)
+                .zip(data[..expected_bytes].par_chunks_exact(BLOCK_BYTES_TQ2_0))
+                .for_each(|(out_block, block)| decode_block(block, out_block));
+        } else {
+            for (out_block, block) in out_trits.chunks_exact_mut(QK_TQ2_0).zip(data[..expected_bytes].chunks_exact(BLOCK_BYTES_TQ2_0)) {
+                decode_block(block, out_block);
             }
         }
 
-        Ok(out_trits)
+        Ok(())
     }
 
     fn transcode_to_velurex_tiled(&self, data: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>, String> {
-        let trits = self.unpack_trits(data, rows, cols)?;
-        let packed_5 = pack_matrix(&trits, rows, cols);
-        Ok(transform_weights_lut(&packed_5, rows, cols))
+        crate::transcoder::transcode_to_tiled(self, data, rows, cols, 32)
     }
 }

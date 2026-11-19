@@ -5,7 +5,7 @@
 //! Provides activation lookup table (QLUT) precomputation, 32-row tiled matrix
 //! weight transformations, and single/multi-threaded GEMV execution.
 
-use crate::pack::{tile_byte, tile_row_bytes, untile_row, BLOCK_BYTES_5, QK_5};
+use crate::pack::{tile_row_bytes, untile_row, BLOCK_BYTES_5, QK_5};
 use crate::simd::scalar::gemv_lut_block32_scalar;
 
 #[cfg(target_arch = "x86_64")]
@@ -133,17 +133,20 @@ pub fn transform_weights_lut(src: &[u8], rows: usize, cols: usize) -> Vec<u8> {
     let num_blocks = rows / 32;
 
     let mut dst = vec![0u8; num_blocks * 32 * bytes_per_row];
+    if num_blocks == 0 || bytes_per_row == 0 {
+        return dst;
+    }
 
-    for b in 0..num_blocks {
-        let r_base = b * 32;
-        let block_dst = &mut dst[b * (32 * bytes_per_row)..(b + 1) * (32 * bytes_per_row)];
+    let tile_block = |b: usize, block_dst: &mut [u8]| {
+        crate::pack::tile_rows_into::<32>(&src[b * 32 * src_row_bytes..(b + 1) * 32 * src_row_bytes], src_row_bytes, cols, block_dst);
+    };
 
-        for c in 0..bytes_per_row {
-            let col_dst = &mut block_dst[c * 32..(c + 1) * 32];
-            for r in 0..32 {
-                let row = &src[(r_base + r) * src_row_bytes..(r_base + r + 1) * src_row_bytes];
-                col_dst[r] = tile_byte(row, cols, c);
-            }
+    if rows * cols >= crate::pack::PARALLEL_MIN_WEIGHTS {
+        use rayon::prelude::*;
+        dst.par_chunks_exact_mut(32 * bytes_per_row).enumerate().for_each(|(b, block_dst)| tile_block(b, block_dst));
+    } else {
+        for (b, block_dst) in dst.chunks_exact_mut(32 * bytes_per_row).enumerate() {
+            tile_block(b, block_dst);
         }
     }
 

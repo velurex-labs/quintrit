@@ -20,7 +20,8 @@
 //! ## Trade-off:
 //! - Because weights must be dynamically transformed into Velurex 32-row tiles at startup,
 //!   the file cannot be directly zero-copy memory-mapped from disk into execution registers.
-//!   A multi-threaded in-memory transcoding step is performed during model load.
+//!   A multi-threaded in-memory transcoding step is performed during model load: [`transcode_to_tiled`] converts one
+//!   tile (32 or 64 rows) per thread, so the intermediate trits and planar bytes stay in that thread's cache.
 
 use crate::decoders::{get_ternary_decoder, I2_S_DECODER, TernaryDecoder};
 use crate::gguf::GgufFile;
@@ -79,6 +80,79 @@ pub fn transcode_gguf_i2_s_to_velurex_tiled(
     I2_S_DECODER
         .transcode_to_velurex_tiled(packed_planar, rows, cols)
         .expect("Failed to transcode I2_S planar tensor")
+}
+
+/// Transcodes a tensor of `rows x cols` weights of any [`TernaryDecoder`] format into velurex encoding tiles of
+/// `tile_rows` rows (32 for the `quintrit` kernel, 64 for the AVX-512 kernel).
+///
+/// If the format stores its rows independently ([`TernaryDecoder::row_bytes`]), every tile is converted by one thread
+/// from its own slice of the payload (decode, pack, transpose) through buffers that stay in the cache and are reused
+/// for the next tile of that thread; the result does not depend on the number of threads. Other formats are converted
+/// matrix-wide. The rows must be a multiple of `tile_rows`.
+pub fn transcode_to_tiled(
+    decoder: &dyn TernaryDecoder,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    tile_rows: usize,
+) -> Result<Vec<u8>, String> {
+    match tile_rows {
+        32 => transcode_tiles::<32>(decoder, data, rows, cols),
+        64 => transcode_tiles::<64>(decoder, data, rows, cols),
+        other => Err(format!("unsupported tile height {other} (32 or 64)")),
+    }
+}
+
+fn transcode_tiles<const R: usize>(
+    decoder: &dyn TernaryDecoder,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u8>, String> {
+    use quintrit_core::pack::{pack_matrix_into, tile_row_bytes, tile_rows_into, PARALLEL_MIN_WEIGHTS};
+    use rayon::prelude::*;
+
+    if rows % R != 0 {
+        return Err(format!("{rows} rows are not a multiple of the tile height {R}"));
+    }
+    let src_row_bytes = cols.div_ceil(QK_5) * BLOCK_BYTES_5;
+    let tile_bytes = R * tile_row_bytes(cols);
+    let mut out = vec![0u8; rows / R * tile_bytes];
+    if out.is_empty() {
+        return Ok(out);
+    }
+
+    let Some(row_bytes) = decoder.row_bytes(cols) else {
+        // The rows are not independent: decode the whole matrix, then tile it block by block.
+        let trits = decoder.unpack_trits(data, rows, cols)?;
+        let packed = pack_matrix(&trits, rows, cols);
+        for (b, tile) in out.chunks_exact_mut(tile_bytes).enumerate() {
+            tile_rows_into::<R>(&packed[b * R * src_row_bytes..(b + 1) * R * src_row_bytes], src_row_bytes, cols, tile);
+        }
+        return Ok(out);
+    };
+    if data.len() < rows * row_bytes {
+        return Err(format!("{} data buffer too short: expected {} bytes, got {}", decoder.format_name(), rows * row_bytes, data.len()));
+    }
+
+    let convert = |(trits, packed): &mut (Vec<i8>, Vec<u8>), b: usize, tile: &mut [u8]| -> Result<(), String> {
+        decoder.unpack_trits_into(&data[b * R * row_bytes..(b + 1) * R * row_bytes], R, cols, trits)?;
+        pack_matrix_into(trits, R, cols, packed);
+        tile_rows_into::<R>(packed, src_row_bytes, cols, tile);
+        Ok(())
+    };
+    let buffers = || (vec![0i8; R * cols], vec![0u8; R * src_row_bytes]);
+    if rows * cols >= PARALLEL_MIN_WEIGHTS {
+        out.par_chunks_exact_mut(tile_bytes)
+            .enumerate()
+            .try_for_each_init(buffers, |bufs, (b, tile)| convert(bufs, b, tile))?;
+    } else {
+        let mut bufs = buffers();
+        for (b, tile) in out.chunks_exact_mut(tile_bytes).enumerate() {
+            convert(&mut bufs, b, tile)?;
+        }
+    }
+    Ok(out)
 }
 
 /// Transcodes raw trits (`-1, 0, +1`) directly into 1.60 bpw velurex encoding 32-row tiled layout.

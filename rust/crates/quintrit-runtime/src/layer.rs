@@ -450,6 +450,20 @@ impl BlockScaledLayer {
         })
     }
 
+    /// Builds the layer straight from a `Q2_0` payload of `rows x cols` weights in blocks of `block_size` (64 or 128):
+    /// the weights are decoded and packed in groups of rows on all threads, without the intermediate array of trits that
+    /// [`Self::new`] needs. The result is the layer `new` builds from `quintrit_format::decode_q2_0`.
+    pub fn from_q2_0(data: &[u8], rows: usize, cols: usize, block_size: usize, num_threads: usize) -> Result<Self, String> {
+        use quintrit_core::block_scaled::SCALE_BLOCK;
+        if rows == 0 || cols == 0 || !cols.is_multiple_of(SCALE_BLOCK) {
+            return Err(format!(
+                "a {rows} x {cols} block-scaled projection needs a column count that is a multiple of {SCALE_BLOCK}"
+            ));
+        }
+        let (packed, scales) = quintrit_format::decode_q2_0_packed(data, rows, cols, block_size)?;
+        Ok(Self { packed, scales, rows, cols, num_threads: num_threads.max(1) })
+    }
+
     pub fn set_num_threads(&mut self, threads: usize) {
         self.num_threads = threads.max(1);
     }
@@ -750,12 +764,10 @@ pub fn dispatch_ternary_layer(
             )))
         }
         TernaryKernelType::QuintritLutAVX512 => {
-            let trits = decoder.unpack_trits(raw_data, rows, cols)?;
-            let quintrit_packed = quintrit_core::pack::pack_matrix(&trits, rows, cols);
             #[cfg(target_arch = "x86_64")]
-            let transformed = quintrit_core::lut::transform_weights_lut_64(&quintrit_packed, rows, cols);
+            let transformed = quintrit_format::transcode_to_tiled(decoder, raw_data, rows, cols, 64)?;
             #[cfg(not(target_arch = "x86_64"))]
-            let transformed = quintrit_core::lut::transform_weights_lut(&quintrit_packed, rows, cols);
+            let transformed = quintrit_format::transcode_to_tiled(decoder, raw_data, rows, cols, 32)?;
             Ok(LinearLayer::QuintritAVX512(QuintritLutAVX512Layer::new(
                 transformed,
                 rows,

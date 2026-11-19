@@ -24,6 +24,7 @@ pub mod lut;
 pub mod pack;
 pub mod simd;
 pub mod threading;
+pub mod unpack;
 
 pub use lut::{
     build_activation_lut, build_activation_lut_wide, build_activation_lut_wide_into,
@@ -41,7 +42,7 @@ pub use lut::{
 pub use limits::{gemv_cols_supported, MAX_GEMV_COLS, MAX_THREADS};
 
 pub use pack::{
-    pack_5trits, pack_matrix, split_activation_planes, unpack_matrix, BLOCK_BYTES_5,
+    pack_5trits, pack_matrix, pack_matrix_into, split_activation_planes, unpack_matrix, BLOCK_BYTES_5,
     BYTE_TO_TRITS, QK_5,
 };
 

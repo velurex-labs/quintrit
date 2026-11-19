@@ -10,7 +10,7 @@ pub mod tq1_0;
 pub mod tq2_0;
 
 pub use i2_s::I2sDecoder;
-pub use q2_0::decode_q2_0;
+pub use q2_0::{decode_q2_0, decode_q2_0_packed};
 pub use tq1_0::Tq1_0Decoder;
 pub use tq2_0::Tq2_0Decoder;
 
@@ -29,6 +29,23 @@ pub trait TernaryDecoder: Send + Sync {
 
     /// Unpacks raw tensor bytes into a contiguous slice of trits in `{-1, 0, +1}`.
     fn unpack_trits(&self, data: &[u8], rows: usize, cols: usize) -> Result<Vec<i8>, String>;
+
+    /// Bytes of one row of `cols` weights, if the rows of a tensor are stored independently one after another (so that a
+    /// block of rows can be decoded from its own slice of the payload); `None` if they are not. The fused transcoder
+    /// ([`crate::transcoder::transcode_to_tiled`]) needs it to convert block by block on several threads.
+    fn row_bytes(&self, _cols: usize) -> Option<usize> {
+        None
+    }
+
+    /// Like [`Self::unpack_trits`], but writes into `out` (`rows * cols` trits) so that the caller can reuse the buffer.
+    fn unpack_trits_into(&self, data: &[u8], rows: usize, cols: usize, out: &mut [i8]) -> Result<(), String> {
+        let trits = self.unpack_trits(data, rows, cols)?;
+        if out.len() != trits.len() {
+            return Err(format!("output buffer holds {} trits, expected {}", out.len(), trits.len()));
+        }
+        out.copy_from_slice(&trits);
+        Ok(())
+    }
 
     /// Transcodes raw tensor bytes directly into 1.60 bpw velurex encoding 32-row tiled format in RAM.
     fn transcode_to_velurex_tiled(&self, data: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>, String>;

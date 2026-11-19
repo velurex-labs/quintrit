@@ -26,7 +26,7 @@
 //!    - **VNNI Acceleration:** Direct 32-bit hardware dot-product accumulation via `_mm512_dpbusd_epi32`.
 
 use core::arch::x86_64::*;
-use crate::pack::{tile_byte, tile_row_bytes, untile_row, BLOCK_BYTES_5, QK_5};
+use crate::pack::{tile_row_bytes, untile_row, BLOCK_BYTES_5, QK_5};
 use crate::lut::{check_gemv_buffers, MAP_34, MAP_012};
 
 /// Whether the CPU supports the AVX-512 subset every 64-row kernel needs (F, BW and VBMI).
@@ -57,17 +57,20 @@ pub fn transform_weights_lut_64(src: &[u8], rows: usize, cols: usize) -> Vec<u8>
     let num_blocks = rows / 64;
 
     let mut dst = vec![0u8; num_blocks * 64 * bytes_per_row];
+    if num_blocks == 0 || bytes_per_row == 0 {
+        return dst;
+    }
 
-    for b in 0..num_blocks {
-        let r_base = b * 64;
-        let block_dst = &mut dst[b * (64 * bytes_per_row)..(b + 1) * (64 * bytes_per_row)];
+    let tile_block = |b: usize, block_dst: &mut [u8]| {
+        crate::pack::tile_rows_into::<64>(&src[b * 64 * src_row_bytes..(b + 1) * 64 * src_row_bytes], src_row_bytes, cols, block_dst);
+    };
 
-        for c in 0..bytes_per_row {
-            let col_dst = &mut block_dst[c * 64..(c + 1) * 64];
-            for r in 0..64 {
-                let row = &src[(r_base + r) * src_row_bytes..(r_base + r + 1) * src_row_bytes];
-                col_dst[r] = tile_byte(row, cols, c);
-            }
+    if rows * cols >= crate::pack::PARALLEL_MIN_WEIGHTS {
+        use rayon::prelude::*;
+        dst.par_chunks_exact_mut(64 * bytes_per_row).enumerate().for_each(|(b, block_dst)| tile_block(b, block_dst));
+    } else {
+        for (b, block_dst) in dst.chunks_exact_mut(64 * bytes_per_row).enumerate() {
+            tile_block(b, block_dst);
         }
     }
 

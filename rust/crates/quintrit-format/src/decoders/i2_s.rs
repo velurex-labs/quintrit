@@ -7,6 +7,7 @@ use crate::gguf::GGML_TYPE_I2_S;
 use rayon::prelude::*;
 use quintrit_core::lut::transform_weights_lut;
 use quintrit_core::pack::pack_matrix;
+use quintrit_core::unpack::{decode_2bit_planes, PlaneOrder};
 
 /// Canonical GGUF `GGML_TYPE_I2_S` block dimensions (128 trits in 32 bytes, identical on every CPU architecture).
 pub const QK_GGUF_I2_S: usize = 128;
@@ -40,25 +41,29 @@ pub fn pack_gguf_i2_s(trits: &[i8], rows: usize, cols: usize) -> Vec<u8> {
 
 /// Unpacks planar GGUF `I2_S` weights into trits in `{-1, 0, +1}` (code 3 decodes to 0).
 pub fn unpack_gguf_i2_s(packed: &[u8], rows: usize, cols: usize) -> Vec<i8> {
+    let mut trits = vec![0i8; rows * cols];
+    unpack_gguf_i2_s_into(packed, rows, cols, &mut trits);
+    trits
+}
+
+/// Like [`unpack_gguf_i2_s`], but writes into `trits` (`rows * cols` entries).
+pub fn unpack_gguf_i2_s_into(packed: &[u8], rows: usize, cols: usize, trits: &mut [i8]) {
     assert_eq!(cols % QK_GGUF_I2_S, 0, "cols must be a multiple of {QK_GGUF_I2_S}");
     assert_eq!(packed.len(), rows * cols / 4, "packed length must be rows * cols / 4");
+    assert_eq!(trits.len(), rows * cols, "output length must be rows * cols");
     let bytes_per_row = cols / 4;
-    let mut trits = vec![0i8; rows * cols];
-    for r in 0..rows {
-        for b in 0..cols / QK_GGUF_I2_S {
-            let src = &packed[r * bytes_per_row + b * BLOCK_BYTES_GGUF_I2_S..][..BLOCK_BYTES_GGUF_I2_S];
-            let out = &mut trits[r * cols + b * QK_GGUF_I2_S..][..QK_GGUF_I2_S];
-            for (j, w) in out.iter_mut().enumerate() {
-                let code = (src[j % GROUP_SIZE_GGUF_I2_S] >> (6 - 2 * (j / GROUP_SIZE_GGUF_I2_S))) & 3;
-                *w = match code {
-                    0 => -1,
-                    2 => 1,
-                    _ => 0,
-                };
-            }
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    // A row is a whole number of 32-byte blocks; plane 0 sits in the high bits (SIMD on AVX2 and NEON, see `unpack`).
+    let unpack_row = |src_row: &[u8], out_row: &mut [i8]| decode_2bit_planes(src_row, out_row, PlaneOrder::HighFirst);
+    if rows * cols >= quintrit_core::pack::PARALLEL_MIN_WEIGHTS {
+        trits.par_chunks_exact_mut(cols).zip(packed.par_chunks_exact(bytes_per_row)).for_each(|(out, src)| unpack_row(src, out));
+    } else {
+        for (out, src) in trits.chunks_exact_mut(cols).zip(packed.chunks_exact(bytes_per_row)) {
+            unpack_row(src, out);
         }
     }
-    trits
 }
 
 
@@ -79,6 +84,25 @@ impl TernaryDecoder for I2sDecoder {
     #[inline]
     fn nominal_bpw(&self) -> f32 {
         2.0
+    }
+
+    fn row_bytes(&self, cols: usize) -> Option<usize> {
+        cols.is_multiple_of(QK_GGUF_I2_S).then_some(cols / 4)
+    }
+
+    fn unpack_trits_into(&self, data: &[u8], rows: usize, cols: usize, out: &mut [i8]) -> Result<(), String> {
+        if cols % QK_GGUF_I2_S != 0 {
+            return Err(format!("I2_S cols must be a multiple of {QK_GGUF_I2_S} (got cols={cols})"));
+        }
+        let expected_bytes = (rows * cols) / 4;
+        if data.len() < expected_bytes {
+            return Err(format!("I2_S data buffer too short: expected {} bytes, got {}", expected_bytes, data.len()));
+        }
+        if out.len() != rows * cols {
+            return Err(format!("output buffer holds {} trits, expected {}", out.len(), rows * cols));
+        }
+        unpack_gguf_i2_s_into(&data[..expected_bytes], rows, cols, out);
+        Ok(())
     }
 
     fn unpack_trits(&self, data: &[u8], rows: usize, cols: usize) -> Result<Vec<i8>, String> {
@@ -107,6 +131,11 @@ impl TernaryDecoder for I2sDecoder {
             ));
         }
 
+        if rows % 32 == 0 {
+            return crate::transcoder::transcode_to_tiled(self, data, rows, cols, 32);
+        }
+
+        // A row count that is no multiple of 32: the last block is padded with neutral rows.
         let packed_planar = &data[..expected_bytes];
         let bytes_per_row_5 = quintrit_core::pack::tile_row_bytes(cols);
         let num_blocks = rows / 32;

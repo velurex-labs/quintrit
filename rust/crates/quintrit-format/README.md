@@ -22,7 +22,7 @@ Finalizing an immutable on-disk file specification prematurely risks technical d
 
 ### 3. Operational Trade-Off: In-Memory Transcoding vs. Zero-Copy Mmap
 Because weights on disk are stored in standard GGUF formats (e.g. 2.00 bpw planar `GGML_TYPE_I2_S` or unquantized trits), **direct zero-copy memory-mapping (`mmap`) straight into execution registers is not possible**:
-- **Startup Phase**: The entire weight tensor must first be read from disk into host memory and transformed on-the-fly into the 1.60 bpw 32-row tiled Velurex representation. This pass is fully parallelized across CPU cores via Rayon.
+- **Startup Phase**: The entire weight tensor must first be read from disk into host memory and transformed on-the-fly into the 1.60 bpw 32-row tiled Velurex representation. The pass runs on all cores (Rayon): every tile of 32 or 64 rows is decoded, packed and transposed by one thread through small buffers that stay in its cache, and the decoding of the 2-bit codes uses AVX2 or NEON (chosen at run time) with a portable fallback that gives identical bytes. Starting a model from a cold disk is then limited by the read speed of the disk, not by this conversion.
 - **Runtime Phase**: Once resident in RAM, weights occupy canonical 1.60 bpw (5 trits per byte), delivering the full **20.0% DRAM traffic and bandwidth reduction** and executing at maximum speed on SIMD GEMV kernels.
 
 ---
@@ -31,7 +31,7 @@ Because weights on disk are stored in standard GGUF formats (e.g. 2.00 bpw plana
 
 - **GGUF v2/v3 Parser**: Parses GGUF metadata, architecture parameters, and tensor catalogs using memory-mapped files. GGUF is the only model format read.
 - **Hardened Against Malformed Files**: Every count, length, shape, offset and the alignment is validated against the real file size with checked arithmetic before anything is allocated (see "Malformed and hostile files" below).
-- **Multi-Threaded Transcoding**: Transcodes planar `I2_S` 2.00 bpw tensors into Velurex 1.60 bpw 32-row tiled layouts in parallel across 32-row blocks.
+- **Multi-Threaded, Vectorized Transcoding**: Transcodes `I2_S`, `TQ1_0` and `TQ2_0` tensors into Velurex 1.60 bpw tiled layouts (32 rows, or 64 rows for the AVX-512 kernel, see `transcode_to_tiled`) in parallel across tiles, and decodes `Q2_0` tensors (`decode_q2_0`, `decode_q2_0_packed`) across blocks and groups of rows. The result is byte-identical for any number of threads and any instruction set.
 - **100% Bit-for-Bit Parity Verification**: Includes programmatic verification (`verify_transcoded_parity`) proving that decoded weights in RAM match original GGUF trits bit-for-bit.
 - **DRAM Footprint Telemetry**: Provides exact memory usage and bandwidth reduction metrics (`dram_savings_pct`).
 

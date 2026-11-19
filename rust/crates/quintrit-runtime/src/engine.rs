@@ -214,6 +214,7 @@ impl InferenceEngine {
         }
 
         let target_kernel = force_kernel.unwrap_or(TernaryKernelType::QuintritLut);
+        progress!("    [{:.2?}] configuration validated", t0.elapsed());
 
         progress!(
             "    Arch: {:?} | Layers: {} | Hidden: {} | FFN: {} | GQA: {}:{} | Kernel: {:?}",
@@ -258,6 +259,7 @@ impl InferenceEngine {
             config.bos_token_id,
             config.eos_token_id,
         )?;
+        progress!("    [{:.2?}] tokenizer ready", t0.elapsed());
 
         let (model, kv_cache) = if matches!(config.architecture, ModelArchitecture::Qwen35 | ModelArchitecture::NemotronHMoe) {
             progress!("==> Loading hybrid layers ({:?})...", config.architecture);
@@ -295,6 +297,8 @@ impl InferenceEngine {
                     None,
                 ),
             };
+
+            progress!("    [{:.2?}] token embeddings loaded", t0.elapsed());
 
             // 4. Load Output RMSNorm
             progress!("==> Loading output RMSNorm...");
@@ -351,6 +355,8 @@ impl InferenceEngine {
                 });
             }
 
+            progress!("    [{:.2?}] decoder layers transcoded", t0.elapsed());
+
             // The output head: an F16 table, a Q2_0 matrix, or the token embedding (tied).
             let (lm_head, lm_head_f16) = match gguf.tensors.get("output.weight").map(|t| t.tensor_type) {
                 Some(quintrit_format::GGML_TYPE_Q2_0) => (
@@ -372,6 +378,8 @@ impl InferenceEngine {
                 hybrid: None,
             };
 
+            progress!("    [{:.2?}] output head loaded", t0.elapsed());
+
             // 6. Preallocate KV-Cache
             progress!("==> Preallocating KV cache for {} tokens...", config.max_position_embeddings);
             let kv_cache = KVCache::try_new(
@@ -382,6 +390,8 @@ impl InferenceEngine {
             )?;
             (model, kv_cache)
         };
+
+        progress!("    [{:.2?}] KV cache allocated", t0.elapsed());
 
         // Every tensor of the file must have been used: a tensor that no loader reads is a feature this runtime does not
         // implement, and running the model without it would give wrong results.
@@ -398,6 +408,7 @@ impl InferenceEngine {
 
         let sampler = Sampler::new(SamplingConfig::default());
         let scratchpad = crate::scratchpad::InferenceScratchpad::new(&config, config.max_position_embeddings);
+        progress!("    [{:.2?}] scratchpad allocated", t0.elapsed());
         let load_duration = t0.elapsed();
         progress!("==> Model successfully loaded in {:.2?}", load_duration);
 
@@ -776,8 +787,7 @@ pub(crate) fn load_projection(
     let data = gguf.get_tensor_data(name).ok_or_else(|| format!("Failed to read tensor '{name}'"))?;
     if info.tensor_type == quintrit_format::GGML_TYPE_Q2_0 {
         let block = info.block_size.ok_or_else(|| format!("tensor '{name}': unknown Q2_0 block size"))?;
-        let (trits, scales) = quintrit_format::decode_q2_0(data, rows, cols, block).map_err(|e| format!("{name}: {e}"))?;
-        let layer = crate::layer::BlockScaledLayer::new(&trits, scales, rows, cols, num_threads)?;
+        let layer = crate::layer::BlockScaledLayer::from_q2_0(data, rows, cols, block, num_threads).map_err(|e| format!("{name}: {e}"))?;
         return Ok(crate::layer::LinearLayer::BlockScaled(layer));
     }
     let scale = match gguf.get_tensor_scale(name) {

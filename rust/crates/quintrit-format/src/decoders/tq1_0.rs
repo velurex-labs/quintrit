@@ -11,8 +11,8 @@
 
 use super::TernaryDecoder;
 use crate::gguf::GGML_TYPE_TQ1_0;
-use quintrit_core::lut::transform_weights_lut;
-use quintrit_core::pack::pack_matrix;
+use quintrit_core::pack::PARALLEL_MIN_WEIGHTS;
+use rayon::prelude::*;
 
 /// Block size in number of weights.
 pub const QK_TQ1_0: usize = 256;
@@ -38,7 +38,17 @@ impl TernaryDecoder for Tq1_0Decoder {
         1.6875
     }
 
+    fn row_bytes(&self, cols: usize) -> Option<usize> {
+        cols.is_multiple_of(QK_TQ1_0).then_some(cols / QK_TQ1_0 * BLOCK_BYTES_TQ1_0)
+    }
+
     fn unpack_trits(&self, data: &[u8], rows: usize, cols: usize) -> Result<Vec<i8>, String> {
+        let mut trits = vec![0i8; rows * cols];
+        self.unpack_trits_into(data, rows, cols, &mut trits)?;
+        Ok(trits)
+    }
+
+    fn unpack_trits_into(&self, data: &[u8], rows: usize, cols: usize, out_trits: &mut [i8]) -> Result<(), String> {
         let total_weights = rows * cols;
         if total_weights % QK_TQ1_0 != 0 {
             return Err(format!(
@@ -56,7 +66,9 @@ impl TernaryDecoder for Tq1_0Decoder {
             ));
         }
 
-        let mut out_trits = vec![0i8; total_weights];
+        if out_trits.len() != total_weights {
+            return Err(format!("output buffer holds {} trits, expected {}", out_trits.len(), total_weights));
+        }
 
         // ggml stores five trits per byte as a base-3 fraction with the first trit most significant;
         // trit `n` is recovered by multiplying with 3^n modulo 256 and scaling by 3 / 256
@@ -68,42 +80,48 @@ impl TernaryDecoder for Tq1_0Decoder {
             (((q * 3) >> 8) as i16 - 1) as i8
         };
 
-        for b in 0..num_blocks {
-            let block_offset = b * BLOCK_BYTES_TQ1_0;
-            let block = &data[block_offset..block_offset + BLOCK_BYTES_TQ1_0];
+        // Fixed trip counts and no branches, so that the compiler vectorizes the loops for the target.
+        let decode_block = |block: &[u8], out_block: &mut [i8]| {
             let qs = &block[0..48];
             let qh = &block[48..52];
-            let mut out = b * QK_TQ1_0;
+            let (out_32, rest) = out_block.split_at_mut(160);
+            let (out_16, out_4) = rest.split_at_mut(80);
 
             // 32 bytes -> 160 trits
-            for n in 0..5 {
+            for (n, plane) in out_32.chunks_exact_mut(32).enumerate() {
                 for m in 0..32 {
-                    out_trits[out] = digit(qs[m], n);
-                    out += 1;
+                    plane[m] = digit(qs[m], n);
                 }
             }
             // 16 bytes -> 80 trits
-            for n in 0..5 {
+            for (n, plane) in out_16.chunks_exact_mut(16).enumerate() {
                 for m in 0..16 {
-                    out_trits[out] = digit(qs[32 + m], n);
-                    out += 1;
+                    plane[m] = digit(qs[32 + m], n);
                 }
             }
             // 4 bytes -> 16 trits (four trits per byte)
-            for n in 0..4 {
+            for (n, plane) in out_4.chunks_exact_mut(4).enumerate() {
                 for j in 0..4 {
-                    out_trits[out] = digit(qh[j], n);
-                    out += 1;
+                    plane[j] = digit(qh[j], n);
                 }
+            }
+        };
+
+        if total_weights >= PARALLEL_MIN_WEIGHTS {
+            out_trits
+                .par_chunks_exact_mut(QK_TQ1_0)
+                .zip(data[..expected_bytes].par_chunks_exact(BLOCK_BYTES_TQ1_0))
+                .for_each(|(out_block, block)| decode_block(block, out_block));
+        } else {
+            for (out_block, block) in out_trits.chunks_exact_mut(QK_TQ1_0).zip(data[..expected_bytes].chunks_exact(BLOCK_BYTES_TQ1_0)) {
+                decode_block(block, out_block);
             }
         }
 
-        Ok(out_trits)
+        Ok(())
     }
 
     fn transcode_to_velurex_tiled(&self, data: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>, String> {
-        let trits = self.unpack_trits(data, rows, cols)?;
-        let packed_5 = pack_matrix(&trits, rows, cols);
-        Ok(transform_weights_lut(&packed_5, rows, cols))
+        crate::transcoder::transcode_to_tiled(self, data, rows, cols, 32)
     }
 }
