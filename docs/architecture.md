@@ -9,6 +9,7 @@ rust/
 │   ├── quintrit-format    GGUF reader, ternary tensor decoders, transcoder into the tiled layout
 │   ├── quintrit-bitnet    Rust transcription of the 4-trit BitNet kernels, the comparison baseline (Rust only, not published)
 │   ├── quintrit-runtime   transformer engine, KV cache, tokenizer, sampling, the `quintrit` command-line tool
+│   ├── quintrit-cuda      optional NVIDIA GPU backend: CUDA kernels, driver layer, device profiles (not in the default build)
 │   ├── quintrit-c         C ABI (`quintrit_c` library, `quintrit.h`) and the header-only C++ wrapper `quintrit.hpp`
 │   └── quintrit-py        Python package `quintrit` (PyO3 and maturin; a standalone package outside the workspace)
 ```
@@ -16,6 +17,10 @@ rust/
 The dependencies point one way: `quintrit-core` depends on nothing but `rayon`; `quintrit-format` and
 `quintrit-runtime` build on it; the C and Python packages wrap all three levels. `quintrit-bitnet` also builds on
 `quintrit-core` and is used only for comparisons; the C and Python packages do not include it.
+
+`quintrit-cuda` is not part of the default build. `quintrit-runtime`, `quintrit-c` and `quintrit-py` enable it with their
+cargo feature `cuda`; it loads the CUDA driver at run time and compiles its kernels with `nvcc` only when the toolkit is
+there ([`guides/gpu.md`](guides/gpu.md)).
 
 The bindings expose the same three levels:
 
@@ -65,6 +70,14 @@ For future releases, the roadmap includes introducing a dedicated native file co
   - **Instant startup:** Completely eliminates startup transcoding overhead—models begin generating tokens immediately.
   - **Zero RAM allocation for weights:** The operating system's unified page cache streams pages directly from disk/SSD on demand, avoiding duplicate weight copies in user-space RAM.
   - **Process sharing:** Multiple local inference processes or workers can map the identical physical file pages concurrently without multiplying system RAM usage.
+
+## The GPU path
+
+With `--device cuda` (or `load_from_gguf_on_gpu`, `quintrit_model_open_gpu`, `Model.load(device="cuda")`) the same GGUF file is
+read and the ternary tensors are decoded as on the CPU, but they are transcoded into the planar layout the GPU kernels read
+(`quintrit_format::transcode_to_planar`) and uploaded; the stacked query, key and value matrices and the interleaved gate and up
+matrices are built on the host. The KV cache, the buffers of a token and a CUDA graph of the whole token live in a session on
+the device. The tokenizer, the sampler, the stop handling and the prefix reuse are the CPU runtime's.
 
 ## The tile layout
 

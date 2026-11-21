@@ -44,6 +44,8 @@ pub enum Kind {
     StaleStream,
     /// The prompt does not fit into the context window.
     ContextOverflow,
+    /// A call to the GPU failed, or no usable GPU is present.
+    Device,
     /// A bug or an unexpected panic inside the native code.
     Internal,
 }
@@ -67,6 +69,7 @@ impl Kind {
             Kind::Generation => "GenerationError",
             Kind::StaleStream => "StaleStreamError",
             Kind::ContextOverflow => "ContextOverflowError",
+            Kind::Device => "DeviceError",
             Kind::Internal => "InternalError",
         }
     }

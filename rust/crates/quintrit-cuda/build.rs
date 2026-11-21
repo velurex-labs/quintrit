@@ -1,0 +1,114 @@
+//! Compiles the CUDA kernels in `kernels/*.cu` into fat binaries when the CUDA toolkit is available.
+//!
+//! The kernels are built for `sm_80`, `sm_86` and `sm_89` (SASS) and for `compute_89` (PTX, which the driver compiles
+//! for newer GPUs). Without `nvcc` the crate still builds; it then contains no kernels and every attempt to load one
+//! returns [`Error::NoKernels`]. This keeps `cargo build` and `cargo test` of the whole workspace independent of the
+//! toolkit.
+//!
+//! Environment variables:
+//! - `QUINTRIT_CUDA_SKIP_NVCC=1`: do not compile kernels even if `nvcc` exists.
+//! - `QUINTRIT_CUDA_REQUIRE=1`: fail the build if the kernels cannot be compiled.
+//! - `QUINTRIT_CUDA_GENCODE`: replaces the list of `-gencode` options (for example for a single-device build).
+//! - `QUINTRIT_CUDA_NVCC_FLAGS`: extra `nvcc` options (for example `-DATTN_STOP=2` for the timing experiments of the attention kernel).
+//! - `NVCC`, `CUDA_PATH`, `CUDA_HOME`: where to look for the compiler.
+
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const DEFAULT_GENCODE: &[&str] = &[
+    "-gencode=arch=compute_80,code=sm_80",
+    "-gencode=arch=compute_86,code=sm_86",
+    "-gencode=arch=compute_89,code=sm_89",
+    "-gencode=arch=compute_89,code=compute_89",
+];
+
+fn find_nvcc() -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = env::var_os("NVCC") {
+        candidates.push(PathBuf::from(p));
+    }
+    for var in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
+        if let Some(root) = env::var_os(var) {
+            candidates.push(Path::new(&root).join("bin").join(exe));
+        }
+    }
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            candidates.push(dir.join(exe));
+        }
+    }
+    if cfg!(unix) {
+        candidates.push(PathBuf::from("/usr/local/cuda/bin/nvcc"));
+        if let Ok(entries) = fs::read_dir("/usr/local") {
+            let mut versions: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("cuda-")))
+                .collect();
+            versions.sort();
+            versions.reverse();
+            candidates.extend(versions.into_iter().map(|p| p.join("bin").join(exe)));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=kernels");
+    for var in ["QUINTRIT_CUDA_SKIP_NVCC", "QUINTRIT_CUDA_REQUIRE", "QUINTRIT_CUDA_GENCODE", "QUINTRIT_CUDA_NVCC_FLAGS", "NVCC", "CUDA_PATH", "CUDA_HOME"] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let kernels_dir = manifest_dir.join("kernels");
+    let require = env::var("QUINTRIT_CUDA_REQUIRE").is_ok_and(|v| v == "1");
+    let skip = env::var("QUINTRIT_CUDA_SKIP_NVCC").is_ok_and(|v| v == "1");
+
+    let mut sources: Vec<PathBuf> = fs::read_dir(&kernels_dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "cu")).collect())
+        .unwrap_or_default();
+    sources.sort();
+
+    let nvcc = if skip { None } else { find_nvcc() };
+    let mut images: Vec<(String, PathBuf)> = Vec::new();
+    match &nvcc {
+        None => {
+            if require {
+                panic!("QUINTRIT_CUDA_REQUIRE=1 but nvcc was not found (or QUINTRIT_CUDA_SKIP_NVCC=1)");
+            }
+        }
+        Some(nvcc) => {
+            let gencode: Vec<String> = match env::var("QUINTRIT_CUDA_GENCODE") {
+                Ok(v) if !v.trim().is_empty() => v.split_whitespace().map(String::from).collect(),
+                _ => DEFAULT_GENCODE.iter().map(|s| s.to_string()).collect(),
+            };
+            for src in &sources {
+                let name = src.file_stem().and_then(|s| s.to_str()).expect("kernel file name").to_string();
+                let out = out_dir.join(format!("{name}.fatbin"));
+                let mut cmd = Command::new(nvcc);
+                cmd.arg("-std=c++17").arg("-O3").arg("-fatbin").arg("-I").arg(&kernels_dir);
+                if let Ok(extra) = env::var("QUINTRIT_CUDA_NVCC_FLAGS") {
+                    cmd.args(extra.split_whitespace());
+                }
+                cmd.args(&gencode).arg(src).arg("-o").arg(&out);
+                let status = cmd.status().unwrap_or_else(|e| panic!("failed to run {}: {e}", nvcc.display()));
+                if !status.success() {
+                    panic!("nvcc failed for {}", src.display());
+                }
+                images.push((name, out));
+            }
+        }
+    }
+
+    let mut generated = String::from("// Generated by build.rs: the kernel images embedded in the crate.\npub static IMAGES: &[(&str, &[u8])] = &[\n");
+    for (name, path) in &images {
+        let p = path.to_string_lossy().replace('\\', "/");
+        generated.push_str(&format!("    ({name:?}, include_bytes!({p:?})),\n"));
+    }
+    generated.push_str("];\n");
+    fs::write(out_dir.join("images.rs"), generated).expect("write images.rs");
+}

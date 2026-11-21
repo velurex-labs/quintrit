@@ -406,6 +406,26 @@ public:
         handle_.reset(h);
     }
 
+    /// Loads a GGUF model onto an NVIDIA GPU (needs a library built with GPU support, else Error with QUINTRIT_ERR_UNSUPPORTED).
+    /// `context` bounds the context window of its sessions (0 = default).
+    static Model open_gpu(const std::string& path, std::uint32_t device = 0, std::uint32_t context = 0, bool verbose = false) {
+        quintrit_gpu_options_t o;
+        o.struct_size = sizeof(o);
+        o.device_index = device;
+        o.context_length = context;
+        o.flags = verbose ? QUINTRIT_MODEL_OPEN_VERBOSE : 0;
+        quintrit_model_t* h = nullptr;
+        detail::check(quintrit_model_open_gpu(path.c_str(), &o, &h));
+        return Model(Adopt{}, h);
+    }
+
+    /// True if the model runs on a GPU.
+    bool on_gpu() const {
+        std::int32_t device = 0;
+        detail::check(quintrit_model_device(handle_.get(), &device, nullptr));
+        return device == QUINTRIT_DEVICE_CUDA;
+    }
+
     quintrit_model_info_t info() const {
         quintrit_model_info_t i;
         i.struct_size = sizeof(i);
@@ -472,6 +492,9 @@ public:
     quintrit_model_t* get() const noexcept { return handle_.get(); }
 
 private:
+    struct Adopt {};
+    Model(Adopt, quintrit_model_t* h) : handle_(h) {}
+
     struct Deleter {
         void operator()(quintrit_model_t* h) const noexcept { quintrit_model_free(h); }
     };

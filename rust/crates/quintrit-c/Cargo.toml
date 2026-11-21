@@ -18,9 +18,15 @@ name = "quintrit_c"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
+quintrit-cuda = { path = "../quintrit-cuda", version = "0.2.0", optional = true }
 quintrit-core = { path = "../quintrit-core", version = "0.2.0" }
 quintrit-format = { path = "../quintrit-format", version = "0.2.0" }
 quintrit-runtime = { path = "../quintrit-runtime", version = "0.2.0" }
+
+[features]
+# NVIDIA GPU support: `quintrit_cuda_*`, `quintrit_model_open_gpu`. The library then loads the CUDA driver at run time; building the GPU kernels needs the
+# CUDA toolkit. Without the feature the same functions exist and return QUINTRIT_ERR_UNSUPPORTED.
+cuda = ["quintrit-runtime/cuda", "dep:quintrit-cuda"]
 
 [dev-dependencies]
 # Locates a C / C++ compiler (and the MSVC environment) for the C and C++ tests; the tests skip without one.

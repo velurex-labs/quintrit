@@ -32,6 +32,7 @@ def packed(rng):
         (quintrit.QuintritFileNotFoundError, FileNotFoundError),
         (quintrit.ModelLoadError, RuntimeError),
         (quintrit.InternalError, RuntimeError),
+        (quintrit.DeviceError, RuntimeError),
         (quintrit.ContextOverflowError, ValueError),
     ],
 )

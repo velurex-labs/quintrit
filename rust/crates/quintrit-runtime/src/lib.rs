@@ -22,6 +22,8 @@
 pub mod attention;
 pub mod config;
 pub mod engine;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod hybrid;
 pub mod kv_cache;
 pub mod layer;

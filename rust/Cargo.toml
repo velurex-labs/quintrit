@@ -6,6 +6,7 @@ members = [
     "crates/quintrit-bitnet",
     "crates/quintrit-runtime",
     "crates/quintrit-c",
+    "crates/quintrit-cuda",
 ]
 exclude = ["crates/quintrit-py"]
 default-members = [

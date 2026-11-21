@@ -55,6 +55,32 @@ fn main() -> Result<(), String> {
 64-row tiles). Both use velurex encoding (5 trits per byte). See the workspace README, section
 [Kernels](../../../docs/kernels.md).
 
+## NVIDIA GPU (cargo feature `cuda`)
+
+With the feature `cuda` (off by default; it needs the CUDA Toolkit 13.x to build and an NVIDIA GPU of compute capability 8.0 or
+newer to run) the runtime can run a model on a GPU through the crate `quintrit-cuda`:
+
+```bash
+cargo run --release -p quintrit-runtime --features cuda --bin quintrit -- --model model.gguf --device cuda --prompt "What is ternary computing?"
+```
+
+```rust,ignore
+use quintrit_runtime::{InferenceEngine, SamplingConfig};
+
+# fn main() -> Result<(), String> {
+let mut engine = InferenceEngine::load_from_gguf_on_gpu("model.gguf", 0, None)?;   // GPU 0, default context window
+let text = engine.generate_streaming("What is ternary computing?", 64, &SamplingConfig::greedy(), |piece| print!("{piece}"))?;
+# Ok(())
+# }
+```
+
+The weights are transcoded into the GPU layout while the file is read, the KV cache lives on the device, and every token is one
+replayed CUDA graph. Results are bit-identical to the CPU path. `I2_S` models are supported (head dimensions 32, 64, 128 and 256,
+contexts up to 7936 tokens); block-scaled `Q2_0`, mixture-of-experts and hybrid models run on the CPU only and the GPU loader says so.
+`quintrit_runtime::gpu::GpuModel` holds the weights and makes independent sessions (`GpuModel::new_session`), each with its own KV
+cache. The example `examples/gpu_decode_bench.rs` measures the device time of a token. See
+[the GPU guide](../../../docs/guides/gpu.md).
+
 The cargo feature `bitnet-baseline` (off by default) adds two comparison kernels from the crate `quintrit-bitnet`,
 `bitnet_mad` (BitNet's planar multiply-add kernel, AVX2 and NEON) and `bitnet_mad_512` (its widening to AVX-512), both
 with 4 trits per byte. They exist so that the end-to-end benchmarks can compare the 4-trit encoding with the 5-trit

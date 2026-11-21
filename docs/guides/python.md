@@ -70,6 +70,9 @@ for piece in model.stream("<|user|>\nHello\n<|assistant|>\n", max_tokens=48, tem
 progress. Errors are exceptions: `quintrit.QuintritError` and its subclasses (a malformed GGUF file, an unsupported
 kernel, an invalid argument).
 
+On an NVIDIA GPU load the model with `quintrit.Model.load("model.gguf", device="cuda")` in a package built with GPU support; everything
+else stays the same ([`gpu.md`](gpu.md)).
+
 ## Examples
 
 - Standalone examples matching the C/C++ examples are in [`examples/python/`](../../examples/python/):

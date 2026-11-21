@@ -16,8 +16,13 @@ publish = false
 name = "_native"
 crate-type = ["cdylib"]
 
+[features]
+# NVIDIA GPU support: `Model.load(..., device="cuda")`, `cuda_devices()`. Needs the CUDA toolkit at build time and an NVIDIA driver at run time.
+cuda = ["quintrit-runtime/cuda", "dep:quintrit-cuda"]
+
 [dependencies]
 quintrit-core = { path = "../quintrit-core" }
+quintrit-cuda = { path = "../quintrit-cuda", optional = true }
 quintrit-format = { path = "../quintrit-format" }
 quintrit-runtime = { path = "../quintrit-runtime" }
 pyo3 = { version = "0.30", features = ["abi3-py39"] }

@@ -70,10 +70,41 @@ their fused multiply-adds; results can differ between platforms whose math libra
 `powf` differently in the last bit, because a transformer amplifies such a difference after a few dozen tokens. Outside Windows the runtime
 evaluates `log1pf` with its own copy of the x86-64 glibc routine, so x86-64 and AArch64 Linux agree.
 
+## GPU kernels (NVIDIA)
+
+The optional crate `quintrit-cuda` runs the same encoding on NVIDIA GPUs of compute capability 8.0 or newer
+([`guides/gpu.md`](guides/gpu.md)). Its projection kernel reads the weights in the planar layout of
+`quintrit_core::pack::pack_matrix` (a row is a sequence of 160-trit blocks of 32 bytes; byte `j` of a block holds the
+trits of the columns `p·32 + j` for the five planes `p`), decodes a weight byte through a small table in shared memory and
+multiplies with `dp4a` against the `int8` activations: one 32-bit weight word (four bytes) per lane and step, several rows
+per warp so that the activations are read once for all of them. The digit table has four bytes per entry and the fifth digit
+is computed as `(b · 781) >> 16`, which halves the shared-memory wavefronts. Like the CPU kernels it returns the exact
+`int32` product `Σ w·x`, which the tests compare with a brute-force product for random, all `+1`, all `-1` and all `0` weights
+and for extreme activations including `-128`.
+
+- **Epilogues.** The projection kernels have fused epilogues: the gate and up projection (rows interleaved) applies SiLU or
+  squared ReLU and collects the maximum for the next quantization, and the stacked query, key and value projection applies
+  the rotary embedding and appends the key and value to the F16 KV cache.
+- **Configuration by device resources.** Rows per warp, warps per block, how the first weight word and the activations are
+  loaded: the best choice depends on what the GPU has, so the number of multiprocessors and the size of the L2 cache select
+  the nearest of the measured profiles (one for a GPU with 24 multiprocessors and 24 MiB of L2, one for 46 multiprocessors and
+  4 MiB). A row count that a configuration cannot tile falls back to a smaller one that is correct on every device. All
+  configurations return the same integers.
+- **Layer kernels.** Norm with quantization, residual add, attention, the final norm and the F16 output head reproduce the
+  CPU runtime's arithmetic, so the whole forward pass is bit-identical to the CPU path. The attention follows the CPU
+  runtime's flash attention, including the split of the padded key-value axis into four chunks beyond 256 positions.
+  The four chunks of a split axis run in blocks of their own (one block per query head and chunk), so a long context
+  keeps several multiprocessors busy; within a block four lanes compute the score of one position and the chain of the
+  half-precision accumulator, which is sequential per element by definition, runs two elements per thread. The last block
+  that finishes for a head combines the chunk results in the CPU's order.
+- **Layout.** The weights are converted into this layout while a model is loaded; the layout is a run-time representation
+  and not a file format.
+
 ## Requirements
 
 - x86-64: AVX2 for `quintrit`; AVX-512 BW and VBMI for `quintrit_512`.
 - AArch64: NEON (part of the architecture); the dot product (`dotprod`) is used where present.
 - Any other architecture: the portable kernel.
+- NVIDIA GPU (optional): compute capability 8.0 or newer, CUDA Toolkit 13.x to build.
 
 `quintrit.cpu_features()` in Python and `quintrit_cpu_features()` in C report what was detected.

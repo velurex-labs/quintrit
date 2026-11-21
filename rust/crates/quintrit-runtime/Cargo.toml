@@ -20,11 +20,15 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Comparison baseline (Rust only, not published): the BitNet kernels, enabled with the feature `bitnet-baseline`.
 quintrit-bitnet = { path = "../quintrit-bitnet", optional = true }
+# NVIDIA GPU backend (needs the CUDA driver at run time and the CUDA toolkit to build the kernels), enabled with the feature `cuda`.
+quintrit-cuda = { path = "../quintrit-cuda", version = "0.2.0", optional = true }
 
 [features]
 default = []
 # Adds the BitNet kernels `BitnetMad` and `BitnetMad512` (4 trits per byte) to compare them with the quintrit kernels.
 bitnet-baseline = ["dep:quintrit-bitnet"]
+# Runs the decoder on an NVIDIA GPU (compute capability 8.0 or newer) with results bit-identical to the CPU path.
+cuda = ["dep:quintrit-cuda"]
 
 [[bin]]
 name = "quintrit"
@@ -45,3 +49,7 @@ harness = false
 [[bench]]
 name = "token_energy"
 harness = false
+
+[[example]]
+name = "gpu_decode_bench"
+required-features = ["cuda"]

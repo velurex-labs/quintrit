@@ -112,6 +112,12 @@ model.chat([{"role": "user", "content": "Hello"}], max_tokens=32)
   process (they come from the Rust runtime and bypass Python's `sys.stdout`, so `contextlib.redirect_stdout` does not
   capture them).
 * Use `kernel="quintrit"` or `kernel="quintrit_512"` in `Model.load` to force a kernel; all kernels give identical logits.
+* **NVIDIA GPU.** A package built with the cargo feature `cuda` (`maturin develop --release --features cuda`; needs the CUDA
+  Toolkit 13.x to build) runs `I2_S` models on a GPU of compute capability 8.0 or newer: `Model.load(path, device="cuda")`
+  (`"cuda:1"` for the second GPU, `context=2048` to bound the context window). Logits and text are bit-identical to the CPU.
+  `quintrit.cuda_built()` tells whether the package has GPU support and `quintrit.cuda_devices()` lists the GPUs. `threads` and
+  `kernel` do not apply on a GPU; errors from the GPU raise `quintrit.DeviceError`. See
+  [the GPU guide](../../../docs/guides/gpu.md).
 
 ## Errors
 

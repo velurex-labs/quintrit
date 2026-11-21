@@ -151,6 +151,15 @@ impl KVCache {
         &self.v_buf[offset..offset + self.head_dim]
     }
 
+    /// Records that position `pos` has been computed, for a runtime whose keys and values live elsewhere (the GPU decoder): the cache then
+    /// only keeps the bookkeeping of the sequence length, which the engine uses to reuse the common prefix of two prompts.
+    pub fn mark_position(&mut self, pos: usize) {
+        assert!(pos < self.max_seq_len);
+        if pos + 1 > self.current_len {
+            self.current_len = pos + 1;
+        }
+    }
+
     /// Resets the active cache length to zero without deallocating backing memory buffers.
     pub fn reset(&mut self) {
         self.current_len = 0;

@@ -38,6 +38,22 @@ other machines. The language bindings have their own instructions:
 - C and C++: [`rust/crates/quintrit-c/README.md`](rust/crates/quintrit-c/README.md) (header, CMake project, tests)
 - Python: [`rust/crates/quintrit-py/README.md`](rust/crates/quintrit-py/README.md) (maturin build, `pytest`)
 
+## GPU tests
+
+The GPU backend (`rust/crates/quintrit-cuda`, the feature `cuda` of the runtime, the C library and the Python package) needs the
+CUDA Toolkit 13.x to build and an NVIDIA GPU of compute capability 8.0 or newer to run. `cargo test --workspace` needs neither:
+the GPU crate is not part of the default build, and its tests skip themselves and print why when there is no supported GPU or the
+kernels were not built. To run them:
+
+```bash
+cd rust
+cargo test -p quintrit-cuda                                  # device, layout and projection kernels against brute-force ground truth
+cargo test -p quintrit-runtime --features cuda --test gpu_layers   # every layer kernel against the CPU runtime, bit for bit
+cargo test -p quintrit-c --features cuda                     # the C API, the engine and a synthetic model on the GPU (including a 1100-position comparison with the CPU)
+```
+
+Compare GPU results with the CPU path, not with a tolerance: a kernel change must keep the results bit-identical.
+
 ## Pull requests
 
 - Keep a pull request focused on one change and describe what it changes and why.

@@ -26,13 +26,15 @@ Or run it through cargo: `cargo run --release -p quintrit-runtime --bin quintrit
 | `--stop <TEXT>` | Stop generating at this text. |
 | `--threads <N>` | Worker threads (default: the number of CPU cores). |
 | `--kernel <NAME>` | `quintrit` (default; AVX2 and NEON) or `quintrit_512` (AVX-512). See [`../kernels.md`](../kernels.md). |
+| `--device <DEVICE>` | `cpu` (default), `cuda` or `cuda:<index>`: run the model on an NVIDIA GPU (build with `--features cuda`, see [`gpu.md`](gpu.md)). The text is the same as on the CPU. |
+| `--context <N>` | Context window in tokens on a GPU (default 4096, at most 7936). |
 | `--chat` | Interactive multi-turn chat. Each turn re-sends the conversation in the chat template of the model; the KV cache of the previous turn is kept, so only the new part is computed. `/reset` forgets the conversation. |
 | `--bench` | Measure time to first token, tokens per second and memory bandwidth. |
 | `-h`, `--help` | Show the help text. |
 
 ## Models
 
-Any GGUF model with ternary weights (`I2_S`, `TQ1_0` or `TQ2_0`) of the BitNet b1.58, Falcon3 or LLaMA families. The weights are
+Any GGUF model with ternary weights (`I2_S`, `TQ1_0` or `TQ2_0`; `I2_S` models also on a GPU) of the BitNet b1.58, Falcon3 or LLaMA families. The weights are
 transcoded into RAM at start-up, which takes from seconds to minutes depending on the size of the model. Models are not part
 of this repository; take them from their publishers and read their licenses.
 

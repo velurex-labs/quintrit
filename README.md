@@ -48,6 +48,7 @@ The complete mathematical definition and derivation are documented in [`docs/vel
 
 - **Exact Integer Arithmetic:** Operates on the full activation range using a fused $x = 16 \cdot \text{hi} + \text{lo}$ split. Yields identical, bit-exact results across AVX2, AVX-512, and ARM NEON.
 - **Native GGUF Compatibility:** Directly loads standard GGUF models containing `I2_S`, `TQ1_0`, `TQ2_0` or `Q2_0` tensors and transcodes them in memory into velurex-encoded SIMD layouts (`Q2_0`, which has a scale per 64 weights, keeps its scales next to the trits). Supported architectures: BitNet b1.58, LLaMA and Falcon3 (including Falcon-E), Qwen3, Qwen3.5 and Nemotron-H MoE. This guarantees instant, zero-conversion compatibility with existing models from the `llama.cpp` and BitNet ecosystems without requiring separate weight distribution.
+- **NVIDIA GPUs (optional):** The same encoding runs on GPUs of compute capability 8.0 or newer with results bit-identical to the CPU path, from Rust, C, C++ and Python ([`docs/guides/gpu.md`](docs/guides/gpu.md)).
 - **Multi-Platform SIMD:** Hand-optimized kernels for x86-64 (AVX2, AVX-512 with VBMI/VNNI) and AArch64 (ARM NEON with DotProd and I8MM).
 - **Unified C / C++ / Python / Rust API:** Rust workspace (`quintrit-core`, `quintrit-format`, `quintrit-runtime`), C ABI (`libquintrit`), and Python bindings (`quintrit`).
 
@@ -81,7 +82,7 @@ Full documentation and guides are available in [`docs/`](docs/):
 | [`docs/architecture.md`](docs/architecture.md) | System architecture, crate layout, tile formats, and memory pipeline |
 | [`docs/kernels.md`](docs/kernels.md) | Kernel implementations, exact arithmetic, and supported instruction sets |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmarking methodology, memory ceiling analysis, and hardware reports |
-| [`docs/guides/`](docs/guides/) | Guides for Rust, C/C++, Python, and the CLI |
+| [`docs/guides/`](docs/guides/) | Guides for Rust, C/C++, Python, the CLI and running on an NVIDIA GPU |
 
 ### Building & Testing
 
@@ -102,7 +103,7 @@ Planned milestones and future developments:
 
 - **Official Distribution:** Publish packages on [crates.io](https://crates.io) and [PyPI](https://pypi.org) with pre-built binary wheels for Linux, Windows, and macOS.
 - **Pre-Tiled Native Format & Direct `mmap`:** Introduce a dedicated file format / GGUF tensor type extension with pre-tiled velurex weights, enabling direct zero-copy memory mapping (`mmap`) straight from disk without startup transcoding or RAM allocation.
-- **Hardware Acceleration:** Dedicated GPU compute backends, beginning with NVIDIA CUDA.
+- **Hardware Acceleration:** Further GPU backends, and GPU kernels for the block-scaled `Q2_0` models, mixture-of-experts and hybrid models, which run on the CPU only today (the NVIDIA CUDA backend covers the `I2_S` models).
 - **RISC-V Support:** Native kernels for RISC-V processors implementing the RVA23 profile, built on the mandatory RISC-V Vector Extension (RVV 1.0).
 - **Extended Benchmarks:** Full-model end-to-end decoding across additional CPU microarchitectures, including Apple processors (Apple Silicon M-series), alongside dedicated performance benchmarks for long context sequences.
 - **Edge Efficiency:** Telemetry-backed energy consumption profiling (Joules per decoded token) across edge platforms.

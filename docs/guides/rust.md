@@ -80,4 +80,6 @@ cargo run --release --bin gemv
 cargo run --release --bin generate -- path/to/model.gguf
 ```
 
-For the AVX-512 kernel pass `Some(TernaryKernelType::QuintritLutAVX512)` on a CPU that has it.
+For the AVX-512 kernel pass `Some(TernaryKernelType::QuintritLutAVX512)` on a CPU that has it. With the cargo feature `cuda` of
+`quintrit-runtime`, `InferenceEngine::load_from_gguf_on_gpu(path, gpu_index, None)` loads the model onto an NVIDIA GPU instead and the rest
+of the program stays the same ([`gpu.md`](gpu.md)).

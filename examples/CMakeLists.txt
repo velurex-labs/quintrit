@@ -4,6 +4,8 @@
 #   cmake --build build --config Release
 #   ctest --test-dir build -C Release --output-on-failure      # runs the two gemv examples
 #   build/c_generate model.gguf                                 # the generate examples need a GGUF model
+#   cmake -S . -B build -DQUINTRIT_CUDA=ON ...                  # the library with NVIDIA GPU support (needs the CUDA toolkit); then
+#   build/c_generate_gpu model.gguf                             # runs on the GPU (without the option it reports that the build has no GPU support)
 cmake_minimum_required(VERSION 3.14)
 project(quintrit_examples LANGUAGES C CXX)
 
@@ -13,7 +15,7 @@ add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../rust/crates/quintrit-c" quintrit_
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-foreach(name gemv generate)
+foreach(name gemv generate generate_gpu)
   add_executable(c_${name} c/${name}.c)
   target_link_libraries(c_${name} PRIVATE quintrit::quintrit)
   add_executable(cpp_${name} cpp/${name}.cpp)
@@ -28,12 +30,12 @@ add_test(NAME cpp_gemv COMMAND cpp_gemv)
 get_target_property(_quintrit_lib quintrit::quintrit IMPORTED_LOCATION)
 get_filename_component(_quintrit_lib_dir "${_quintrit_lib}" DIRECTORY)
 if(WIN32)
-  foreach(name c_gemv c_generate cpp_gemv cpp_generate)
+  foreach(name c_gemv c_generate c_generate_gpu cpp_gemv cpp_generate cpp_generate_gpu)
     add_custom_command(TARGET ${name} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_quintrit_lib}" "$<TARGET_FILE_DIR:${name}>")
   endforeach()
 else()
-  foreach(name c_gemv c_generate cpp_gemv cpp_generate)
+  foreach(name c_gemv c_generate c_generate_gpu cpp_gemv cpp_generate cpp_generate_gpu)
     set_target_properties(${name} PROPERTIES BUILD_RPATH "${_quintrit_lib_dir}")
   endforeach()
 endif()

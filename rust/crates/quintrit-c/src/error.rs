@@ -34,6 +34,8 @@ pub const QUINTRIT_ERR_BUSY: c_int = 12;
 pub const QUINTRIT_ERR_INTERNAL: c_int = 13;
 /// The handle is NULL, of the wrong type, or already freed.
 pub const QUINTRIT_ERR_INVALID_HANDLE: c_int = 14;
+/// A call to the GPU failed (the CUDA driver reported an error or ran out of device memory).
+pub const QUINTRIT_ERR_DEVICE: c_int = 15;
 
 /// An error that is reported to the caller as a status code plus a message.
 #[derive(Debug)]
@@ -122,6 +124,7 @@ pub fn status_text(code: c_int) -> &'static [u8] {
         QUINTRIT_ERR_CONTEXT_OVERFLOW => b"prompt does not fit into the context window\0",
         QUINTRIT_ERR_BUSY => b"handle is busy\0",
         QUINTRIT_ERR_INTERNAL => b"internal error\0",
+        QUINTRIT_ERR_DEVICE => b"GPU error\0",
         QUINTRIT_ERR_INVALID_HANDLE => b"invalid handle\0",
         _ => b"unknown status code\0",
     }

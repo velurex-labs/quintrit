@@ -33,6 +33,12 @@ Where this applies:
     position embedding cache follows `ggml_rope_cache_init`.
   * quintrit-runtime, module `config`: the choice of the beginning-of-sequence token follows
     the vocabulary loader of llama.cpp.
+  * quintrit-cuda (optional NVIDIA GPU backend): the device code reproduces the operation order of
+    the same ggml routines so that its results are bit-identical to the CPU runtime: the
+    polynomial `expf` and the SiLU/SwiGLU of `ggml_v_expf` and `ggml_v_silu`, the half-precision
+    dot product of `ggml_vec_dot_f16` (accumulator lanes and reduction order), the online-softmax
+    attention with a half-precision accumulator of `ggml_compute_forward_flash_attn_ext_f16_one_chunk`,
+    and the rotary position embedding of `ggml_rope_cache_init`.
 
 The MIT permission notice that applies to this material:
 
@@ -84,7 +90,27 @@ The MIT permission notice that applies to this material is the one reproduced in
 with the copyright line above.
 
 
-3. Other prior work credited for interoperability
+3. Arm Optimized Routines (single-precision exponential)
+-------------------------------------------------------
+
+Project:   https://github.com/ARM-software/optimized-routines
+License:   MIT OR Apache-2.0 WITH LLVM-exception
+Copyright: (c) 2017-2026 Arm Limited.
+
+Where this applies:
+
+  * quintrit-cuda, `kernels/glibc_expf.cuh`: a device implementation of the single-precision
+    exponential of Arm Optimized Routines (`math/expf.c`: argument reduction in double
+    precision, a table of 32 values of 2^(i/32), a cubic polynomial). The same algorithm and
+    table are used by the GNU C Library for `expf`; the GPU code reproduces its results bit for
+    bit so that the attention softmax equals the CPU reference on Linux. The file is written for
+    CUDA and contains no code of the GNU C Library.
+
+The MIT permission notice that applies to this material is the one reproduced in section 1,
+with the copyright line above.
+
+
+4. Other prior work credited for interoperability
 -------------------------------------------------
 
   * The text-generation models whose weights this software can load (for example
@@ -101,11 +127,14 @@ identify the formats and models this software is compatible with. Quintrit is no
 with, endorsed by or sponsored by their owners.
 
 
-4. Third-party software libraries
+5. Third-party software libraries
 ---------------------------------
 
 Quintrit depends on open-source Rust crates, among them `tokenizers` (Hugging Face), `rayon`,
-`serde`, `serde_json`, `ahash` and, for the Python bindings, `pyo3` and `numpy`. They are
+`serde`, `serde_json`, `ahash` and, for the Python bindings, `pyo3` and `numpy`.
+The optional GPU backend loads the NVIDIA CUDA driver library (`libcuda`) at run time and links
+no NVIDIA library; building its kernels needs the NVIDIA CUDA Toolkit (`nvcc`), which is not
+redistributed with this software. They are
 not part of this repository; each is used under its own license (MIT, Apache-2.0 or a
 combination of permissive licenses). Binary distributions (Python wheels,
 shared and static libraries) contain the compiled code of these crates; their license texts

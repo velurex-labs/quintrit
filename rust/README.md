@@ -11,6 +11,7 @@ The code of Quintrit. Overview, documentation and examples are in the [repositor
 | [`quintrit-runtime`](crates/quintrit-runtime/README.md) | Transformer engine, KV cache, tokenizer, sampling and the `quintrit` command-line tool |
 | [`quintrit-c`](crates/quintrit-c/README.md) | C ABI (`quintrit_c` library, `include/quintrit.h`) and the C++ wrapper `include/quintrit.hpp` |
 | [`quintrit-py`](crates/quintrit-py/README.md) | Python package `quintrit` (PyO3 and maturin) |
+| [`quintrit-cuda`](crates/quintrit-cuda/README.md) | Optional NVIDIA GPU backend: CUDA kernels and a driver layer (not in the default build) |
 
 `quintrit-py` is deliberately not a workspace member, so `cargo build` and `cargo test` of the workspace never need a
 Python interpreter.

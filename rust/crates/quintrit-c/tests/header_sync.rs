@@ -91,6 +91,8 @@ fn struct_c_name(rust: &str) -> Option<&'static str> {
         "GenerateParams" => "quintrit_generate_params_t",
         "GenerateResult" => "quintrit_generate_result_t",
         "ChatMessageC" => "quintrit_chat_message_t",
+        "GpuOptions" => "quintrit_gpu_options_t",
+        "CudaDeviceInfo" => "quintrit_cuda_device_info_t",
         _ => return None,
     })
 }
@@ -253,7 +255,7 @@ fn rust_structs(src: &str) -> BTreeMap<String, Vec<(String, String)>> {
 fn structs_match_the_header_field_by_field() {
     let rust = rust_structs(&rust_sources());
     let c = header_structs(&header());
-    assert_eq!(rust.len(), 10, "expected all ten repr(C) structs, found {:?}", rust.keys().collect::<Vec<_>>());
+    assert_eq!(rust.len(), 12, "expected all twelve repr(C) structs, found {:?}", rust.keys().collect::<Vec<_>>());
     for (name, fields) in &rust {
         let Some(cf) = c.get(name) else { panic!("struct {name} is missing from quintrit.h") };
         assert_eq!(cf, fields, "fields of {name}: header (left) vs Rust (right)");

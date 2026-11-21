@@ -205,6 +205,26 @@ If your application must survive such a defect, build the library with the `rele
 - Tensor names (`quintrit_tensor_info_t::name`) and raw tensor data (`quintrit_gguf_tensor_data`) point into the open GGUF handle and become invalid at `quintrit_gguf_close`. The file is memory-mapped: do not modify or truncate it while it is open.
 - The pointer from `quintrit_last_error_message` is valid until the next `quintrit_*` call on the same thread. `quintrit_version`, `quintrit_status_string` and `quintrit_kernel_name` return static strings.
 
+## NVIDIA GPU
+
+The library can run a model on an NVIDIA GPU of compute capability 8.0 or newer when it is built with the cargo feature `cuda`
+(`cargo build -p quintrit-c --features cuda`, or `-DQUINTRIT_CUDA=ON` with the CMake project; the CUDA Toolkit 13.x is needed to
+build, the driver is loaded at run time):
+
+| Function | Purpose |
+|---|---|
+| `quintrit_cuda_device_count`, `quintrit_cuda_device_info` | the GPUs the driver reports, with name, compute capability, multiprocessors, memory and whether the kernels support them |
+| `quintrit_model_open_gpu` | loads a GGUF model onto a GPU; the handle is a `quintrit_model_t` like any other |
+| `quintrit_model_device` | `QUINTRIT_DEVICE_CPU` or `QUINTRIT_DEVICE_CUDA` and the GPU index of a model |
+
+All of them exist in every build. Without GPU support they return `QUINTRIT_ERR_UNSUPPORTED`, so one program works against both builds.
+Tokenizing, sessions and generation use the same functions as for a CPU model; every session of a GPU model keeps its KV cache on the
+device and shares the weights. The results are bit-identical to the CPU path. `I2_S` models are supported; other model kinds return
+`QUINTRIT_ERR_UNSUPPORTED`, and driver errors or a lack of device memory return `QUINTRIT_ERR_DEVICE`. `quintrit_model_info` reports
+kernel `QUINTRIT_KERNEL_AUTO` and 0 threads for a GPU model, and session context lengths are rounded down to a multiple of 256.
+In C++ use `quintrit::Model::open_gpu(path, device, context)` and `Model::on_gpu()`. See [the GPU guide](../../../docs/guides/gpu.md)
+and the examples `generate_gpu.c` and `generate_gpu.cpp`.
+
 ## Models and files
 
 - `quintrit_gguf_*` and `quintrit_model_open` read GGUF v2/v3 files (BitNet b1.58, Falcon3 and LLaMA-style models with `I2_S`, `TQ1_0` or `TQ2_0` ternary tensors). There is no separate on-disk quintrit weight format yet: the tiled layout is produced in memory by `quintrit_gguf_convert_tensor` and `quintrit_model_open`.
@@ -222,6 +242,8 @@ If your application must survive such a defect, build the library with the `rele
 |---|---|
 | `tests/ffi_kernel.rs` | pack / unpack / GEMV through the `extern "C"` functions against brute-force `int64` ground truth, for every usable kernel, many shapes (full tiles, remainder rows and columns, partial 160-trit blocks), thread counts, the full int8 range, and every error path |
 | `tests/ffi_gguf.rs` | a synthetic GGUF file (random ternary weights): listing, metadata, tensor conversion to every layout against the original trits and the format crate's transcoder, bad and randomly damaged files |
+| `tests/ffi_cuda.rs` | the GPU functions: `QUINTRIT_ERR_UNSUPPORTED` in a build without GPU support; with the feature `cuda`, the synthetic model on the GPU against the CPU (greedy and sampled text, several sessions, errors); skips without a supported GPU |
+| `tests/engine_gpu.rs` | with the feature `cuda`: every logit of the GPU decoder against the CPU decoder on the synthetic model, over its short context and over 1100 positions of a model with a context of 1280 (the split of the attended key-value axis into chunks) |
 | `tests/ffi_runtime.rs` | the same synthetic model through the runtime API: tokenizer, greedy generation compared with `quintrit-runtime`'s own engine, streaming, stop sequences, context limits, sessions on several threads, `BUSY`, handle lifetimes, damaged models |
 | `tests/quiet_load.rs` | loading a model prints nothing to the standard output unless `QUINTRIT_MODEL_OPEN_VERBOSE` is set (the load runs in a child process whose output is captured) |
 | `tests/header_sync.rs` | `include/quintrit.h` against the Rust sources: exported functions with parameter and return types, `repr(C)` struct fields, constants, version; header structure (C99, include guard, `extern "C"`) |

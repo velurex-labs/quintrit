@@ -214,6 +214,83 @@ decoded token are measured by the benchmarks below. Their reports will be publis
 repeated on every machine, and each will state the kernel, the instruction set, the hardware, the method and the
 output parity status.
 
+## Decoding on NVIDIA GPUs
+
+The GPU backend ([`guides/gpu.md`](guides/gpu.md)) is measured on two reference cards: an RTX 3070 (compute capability 8.6,
+46 multiprocessors, 4 MB of L2, 8 GB; read-only memory ceiling 422.6 GB/s) and an RTX 4060 (8.9, 24 multiprocessors, 24 MiB
+of L2, 8 GB; ceiling 258.6 GB/s). The model is Falcon3-10B-Instruct-1.58bit (`I2_S`, 40 layers, about 3.4 GB of weights
+on the device including the F16 embedding and output head). Before any speed was measured, the 256 greedy tokens and the
+top-5 logits of the standard prompt were bit-identical to the stored reference on both cards, and so were the 256 tokens of
+the other seven `I2_S` models on the RTX 4060.
+
+### One decoded token
+
+Device time of one token (the CUDA graph, without the host steps), the minimum of five blocks of 200 replays, the position
+before the timed one filled with a pseudo-random token sequence. The weights are far larger than the L2 cache, so every
+replay streams them from device memory, as in generation.
+
+| Context | RTX 3070 | | RTX 4060 | |
+|---:|---:|---:|---:|---:|
+| 62 (RTX 3070) / 79 (RTX 4060) tokens | 8.15-8.17 ms | 122.5 tokens/s | 11.88 ms | 84 tokens/s |
+| 416 | 8.56-8.60 ms | 116.6 tokens/s | 12.20 ms | 82 tokens/s |
+| 2048 | 9.52-9.55 ms | 104.9 tokens/s | 13.3-13.5 ms | 74-75 tokens/s |
+| 3900 | 10.38-10.42 ms | 96.2 tokens/s | 14.71-14.79 ms | 68 tokens/s |
+| 7000 (context window of 7936) | 12.18-12.19 ms | 82.1 tokens/s | 16.96 ms | 59.0 tokens/s |
+
+The last row is a context close to the largest window (7936 positions, `QUINTRIT_GPU_CONTEXT=7936`). The generation loop
+with its host steps (copying the embedding row and the logits, synchronizing; `quintrit --bench --device cuda`, 128 tokens)
+runs at 118.8 tokens/s on the RTX 3070 and at 76-79 tokens/s on the RTX 4060 (measured at short contexts, where the attention is not
+a factor). The RTX 4060 is shared with a desktop in this
+measurement and varies by about 0.3 ms between process launches, so differences below about 2 % are not resolved there.
+
+At short contexts the projections are the whole token and sit near the memory ceiling (the gate, up and down projections at
+about 89 % of it on the RTX 3070); the attention grows with the context: about 11 µs per layer at 416 tokens, 34 µs at 2048,
+56 µs at 3900 and 101 µs at 7000 on the RTX 3070 (the token minus the 8.15 ms without attention, over 40 layers). Its exact half-precision
+accumulator is a sequential chain over the cached positions of a chunk of the key-value axis, and the four chunks of the CPU runtime's
+split run in blocks of their own. A layer has to read the keys and values of the context (8.4 MB at 2048 tokens for the 4 key-value heads),
+which takes 20 µs at the read-only ceiling of the card, so the attention is not limited by memory bandwidth yet.
+
+### Projections against Microsoft's W2A8 GPU kernel
+
+The projections of one token (q, k, v, o, gate, up, down of all layers, without attention and head), measured as CUDA graphs
+with the weights rotated through at least eight times the L2 size, against the W2A8 kernel of Microsoft's BitNet GPU backend
+on the same shapes (which reads 20 % more bytes):
+
+| GPU | Quintrit (1.60 bpw) | W2A8 (2.00 bpw) | Difference |
+|---|---:|---:|---:|
+| RTX 3070 | 5.41 ms | 6.62 ms | -18 % |
+| RTX 4060 | 8.15 ms | 9.67 ms | -16 % |
+
+### Compute capability 8.0 (A100)
+
+The kernels are built for 8.0 (A100), 8.6 and 8.9 and as PTX for newer GPUs. On an A100 PCIe 80 GB (108 multiprocessors, 40 MiB
+of L2) the tests of the GPU crates pass, Falcon3-10B and BitNet 2B reproduce the 256 reference tokens bit for bit, and one decoded
+token takes (the same method as above, no tuning for this GPU: it uses the configuration of the nearest measured profile):
+
+| Context | A100 PCIe 80 GB | |
+|---:|---:|---:|
+| 62 | 5.95-5.96 ms | 167.9 tokens/s |
+| 416 | 6.19-6.20 ms | 161.4 tokens/s |
+| 2048 | 6.86-6.87 ms | 145.8 tokens/s |
+| 3900 | 7.71-7.72 ms | 129.6 tokens/s |
+| 7000 (context window of 7936) | 9.02 ms | 110.9 tokens/s |
+
+The tests of the GPU crates, the parity of Falcon3-10B and BitNet 2B (256 of 256 steps) and the comparison of the GPU decoder with the CPU runtime over
+1100 positions pass on this GPU with the kernels of this release. The generation loop with its host steps ran at 156-161 tokens/s at short contexts
+(measured with an earlier release; the token at 62 tokens is 1 % faster now). The token is not limited by memory bandwidth on this GPU, so the
+configuration of a GPU with a different balance may gain more here than on the other two cards. The A100 was measured with the
+CUDA Toolkit 12.8; the reference cards were measured with 13.4. Variants that suit a GPU with at least as many multiprocessors as blocks of the attention (a tile of 64 positions in the chain, three or four tile buffers) were measured here and are not faster: the tile of 64 costs 2 % at 2048 and 4 % at 3900 tokens.
+
+### Reproducing
+
+```bash
+# from rust/: device time of a token at the given contexts (needs the CUDA Toolkit and a model)
+cargo run --release -p quintrit-runtime --features cuda --example gpu_decode_bench -- model.gguf 79 416 2048
+```
+
+`QUINTRIT_GPU=<index>` selects the GPU and `QUINTRIT_GPU_CONTEXT=<tokens>` bounds the context window. Run it on an
+otherwise idle GPU.
+
 ## Running the benchmarks
 
 All commands run in [`rust/`](../rust/). Use release builds, close other work on the machine, and give every report a

@@ -155,6 +155,50 @@ fn transcode_tiles<const R: usize>(
     Ok(out)
 }
 
+/// Transcodes a tensor of `rows x cols` weights of any [`TernaryDecoder`] format into the planar velurex layout
+/// ([`quintrit_core::pack::pack_matrix`]): rows of whole 160-trit blocks of 32 bytes, in row order, without tiling.
+///
+/// This is the layout the GPU kernels read. It is a run-time representation produced while a model is loaded, not a file
+/// format. As in [`transcode_to_tiled`], formats with independent rows are converted in chunks of 32 rows on several
+/// threads through buffers that stay in the cache; the result does not depend on the number of threads. Any row count is
+/// accepted.
+pub fn transcode_to_planar(decoder: &dyn TernaryDecoder, data: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>, String> {
+    use quintrit_core::pack::{pack_matrix_into, PARALLEL_MIN_WEIGHTS};
+    use rayon::prelude::*;
+
+    const CHUNK_ROWS: usize = 32;
+    let src_row_bytes = cols.div_ceil(QK_5) * BLOCK_BYTES_5;
+    let mut out = vec![0u8; rows * src_row_bytes];
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let Some(row_bytes) = decoder.row_bytes(cols) else {
+        let trits = decoder.unpack_trits(data, rows, cols)?;
+        pack_matrix_into(&trits, rows, cols, &mut out);
+        return Ok(out);
+    };
+    if data.len() < rows * row_bytes {
+        return Err(format!("{} data buffer too short: expected {} bytes, got {}", decoder.format_name(), rows * row_bytes, data.len()));
+    }
+    let convert = |trits: &mut Vec<i8>, chunk: usize, dst: &mut [u8]| -> Result<(), String> {
+        let n = dst.len() / src_row_bytes;
+        decoder.unpack_trits_into(&data[chunk * CHUNK_ROWS * row_bytes..(chunk * CHUNK_ROWS + n) * row_bytes], n, cols, &mut trits[..n * cols])?;
+        pack_matrix_into(&trits[..n * cols], n, cols, dst);
+        Ok(())
+    };
+    if rows * cols >= PARALLEL_MIN_WEIGHTS {
+        out.par_chunks_mut(CHUNK_ROWS * src_row_bytes)
+            .enumerate()
+            .try_for_each_init(|| vec![0i8; CHUNK_ROWS * cols], |trits, (c, dst)| convert(trits, c, dst))?;
+    } else {
+        let mut trits = vec![0i8; CHUNK_ROWS * cols];
+        for (c, dst) in out.chunks_mut(CHUNK_ROWS * src_row_bytes).enumerate() {
+            convert(&mut trits, c, dst)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Transcodes raw trits (`-1, 0, +1`) directly into 1.60 bpw velurex encoding 32-row tiled layout.
 pub fn transcode_trits_to_velurex_tiled(
     raw_trits: &[i8],

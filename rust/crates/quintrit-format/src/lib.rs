@@ -31,7 +31,7 @@ pub use gguf::{
 };
 
 pub use transcoder::{
-    transcode_to_tiled, load_and_transcode_gguf_tensor, transcode_gguf_i2_s_to_velurex_tiled,
+    transcode_to_planar, transcode_to_tiled, load_and_transcode_gguf_tensor, transcode_gguf_i2_s_to_velurex_tiled,
     transcode_trits_to_velurex_tiled, verify_transcoded_parity, TranscodedTernaryMatrix,
 };
 

@@ -10,6 +10,7 @@ cmake_minimum_required(VERSION 3.14)
 project(quintrit_c LANGUAGES C CXX)
 
 option(QUINTRIT_BUILD_TESTS "Build and register the C and C++ test programs" ON)
+option(QUINTRIT_CUDA "Build the library with NVIDIA GPU support (cargo feature cuda; needs the CUDA toolkit)" OFF)
 set(QUINTRIT_CARGO_PROFILE "" CACHE STRING
     "Cargo profile: release, debug, or release-unwind (panics become QUINTRIT_ERR_INTERNAL). Default: from CMAKE_BUILD_TYPE")
 
@@ -67,9 +68,14 @@ else()
   set(_cargo_env)
 endif()
 
+set(_cargo_feature_args)
+if(QUINTRIT_CUDA)
+  set(_cargo_feature_args --features cuda)
+endif()
+
 # Always run cargo; it is a no-op when nothing changed. Both library kinds are produced by one invocation.
 add_custom_target(quintrit_cargo ALL
-  COMMAND ${_cargo_env} ${QUINTRIT_CARGO} build -p quintrit-c ${_cargo_profile_args} --target-dir "${QUINTRIT_TARGET_DIR}"
+  COMMAND ${_cargo_env} ${QUINTRIT_CARGO} build -p quintrit-c ${_cargo_profile_args} ${_cargo_feature_args} --target-dir "${QUINTRIT_TARGET_DIR}"
   WORKING_DIRECTORY "${QUINTRIT_WORKSPACE}"
   BYPRODUCTS "${_shared}" "${_static}"
   COMMENT "cargo build -p quintrit-c (${QUINTRIT_CARGO_PROFILE})"

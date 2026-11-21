@@ -187,8 +187,13 @@ fn tq2_0_bytes(trits: &[i8]) -> Vec<u8> {
     out
 }
 
-/// Builds a model file at `path` and returns the original ternary weights.
+/// Builds a model file at `path` (context window [`CONTEXT`]) and returns the original ternary weights.
 pub fn write_model(path: &Path, seed: u64, flaws: &Flaws) -> TritMap {
+    write_model_with_context(path, seed, flaws, CONTEXT)
+}
+
+/// Like [`write_model`], but the model declares a context window of `context` positions (the weights do not depend on it).
+pub fn write_model_with_context(path: &Path, seed: u64, flaws: &Flaws, context: usize) -> TritMap {
     let mut rng = Rng::new(seed);
     let mut g = Gguf::default();
     let mut trits = TritMap::new();
@@ -214,7 +219,7 @@ pub fn write_model(path: &Path, seed: u64, flaws: &Flaws) -> TritMap {
     g.u32("llama.attention.head_count_kv", KV_HEADS as u32);
     g.f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
     g.f32("llama.rope.freq_base", 10000.0);
-    g.u32("llama.context_length", CONTEXT as u32);
+    g.u32("llama.context_length", context as u32);
     g.string("tokenizer.ggml.model", "gpt2");
     g.u32("tokenizer.ggml.bos_token_id", BOS);
     g.u32("tokenizer.ggml.eos_token_id", EOS);

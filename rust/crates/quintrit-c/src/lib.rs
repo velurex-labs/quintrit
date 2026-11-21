@@ -9,7 +9,8 @@
 //! - **Kernel level** ([`kernel`], [`tiles`]): feature and kernel queries, `quintrit_pack_matrix`,
 //!   `quintrit_unpack_matrix`, `quintrit_gemv_i32` / `quintrit_gemv_f32`.
 //! - **Format level** ([`mod@format`]): `quintrit_gguf_*` to open a GGUF file, list tensors and convert ternary tensors.
-//! - **Runtime level** ([`runtime`]): `quintrit_model_*` and `quintrit_session_*` for tokenization and generation.
+//! - **Runtime level** ([`runtime`]): `quintrit_model_*` and `quintrit_session_*` for tokenization and generation, on the CPU or, with the cargo
+//!   feature `cuda`, on an NVIDIA GPU (`quintrit_model_open_gpu`, [`cuda`]).
 //!
 //! ## Rules every entry point follows
 //! - It returns an `int` status (`0` = `QUINTRIT_OK`); results go through out-parameters. The few functions that cannot
@@ -26,6 +27,7 @@
 //! `release-unwind` profile of the workspace (`cargo build --profile release-unwind -p quintrit-c`), which reports a
 //! panic as `QUINTRIT_ERR_INTERNAL` instead. Use that profile for host applications that must not crash.
 
+pub mod cuda;
 pub mod error;
 pub mod format;
 mod gguf_check;
@@ -34,6 +36,7 @@ pub mod runtime;
 pub mod tiles;
 mod util;
 
+pub use cuda::*;
 pub use error::*;
 pub use format::*;
 pub use kernel::*;

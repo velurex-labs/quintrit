@@ -98,6 +98,9 @@ that returns 0 to continue. See [`examples/c/generate.c`](../../examples/c/gener
 [`examples/cpp/generate.cpp`](../../examples/cpp/generate.cpp). `quintrit_model_format_chat` builds a chat prompt in the
 format of the model, and `quintrit_model_tokenize` and `quintrit_model_detokenize` convert between text and token ids.
 
+On an NVIDIA GPU use `quintrit_model_open_gpu` (C) or `quintrit::Model::open_gpu` (C++) in place of `quintrit_model_open` /
+`quintrit::Model`; the library must be built with GPU support, otherwise the call reports `QUINTRIT_ERR_UNSUPPORTED` ([`gpu.md`](gpu.md)).
+
 ## Building the examples
 
 ```bash

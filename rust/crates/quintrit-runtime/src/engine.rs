@@ -160,6 +160,13 @@ pub struct InferenceEngine {
     cached_reset_count: u64,
     /// Statistics of the last [`InferenceEngine::generate_streaming_with_stops`] call.
     last_generation: GenerationStats,
+    /// The decoder on the GPU, when the model was loaded with [`InferenceEngine::load_from_gguf_on_gpu`]; `kv_cache` is then only the bookkeeping of the
+    /// positions (the keys and values live on the device).
+    #[cfg(feature = "cuda")]
+    gpu: Option<crate::gpu::GpuDecoder>,
+    /// The weights on the GPU (shared by the sessions of a host that manages its own, such as the C API).
+    #[cfg(feature = "cuda")]
+    gpu_model: Option<std::sync::Arc<crate::gpu::GpuModel>>,
 }
 
 /// Token counts and timings of one [`InferenceEngine::generate_streaming_with_stops`] call.
@@ -202,7 +209,106 @@ impl InferenceEngine {
         force_kernel: Option<TernaryKernelType>,
         model_name_hint: Option<&str>,
     ) -> Result<Self, String> {
+        Self::load_impl(gguf, num_threads, force_kernel, model_name_hint, None)
+    }
+
+    /// Loads a model from a GGUF file onto NVIDIA GPU `ordinal` (feature `cuda`): the ternary weights are transcoded into the GPU layout while the file is
+    /// read, the KV cache lives on the device, and every token is computed on the GPU with results bit-identical to the CPU path. `context` bounds the
+    /// context window (default [`crate::gpu::DEFAULT_GPU_CONTEXT`], at most 7936 positions). Models the GPU decoder does not support return an error that
+    /// says why.
+    #[cfg(feature = "cuda")]
+    pub fn load_from_gguf_on_gpu<P: AsRef<Path>>(path: P, ordinal: usize, context: Option<usize>) -> Result<Self, String> {
+        let path_ref = path.as_ref();
+        progress!("==> Loading GGUF model for the GPU: {}", path_ref.display());
+        let gguf = GgufFile::open(path_ref).map_err(|e| e.to_string())?;
+        Self::load_impl(&gguf, 1, None, Some(&path_ref.to_string_lossy()), Some((ordinal, context, true)))
+    }
+
+    /// [`InferenceEngine::load_from_gguf_on_gpu`] for an already parsed GGUF structure.
+    #[cfg(feature = "cuda")]
+    pub fn load_from_parsed_gguf_on_gpu(gguf: &GgufFile, ordinal: usize, context: Option<usize>, model_name_hint: Option<&str>) -> Result<Self, String> {
+        Self::load_impl(gguf, 1, None, model_name_hint, Some((ordinal, context, true)))
+    }
+
+    /// Loads only the weights onto the GPU: the engine has the tokenizer and the model description (and the embedding table) but no session, so
+    /// [`InferenceEngine::forward_token`] fails; the sessions are made from [`InferenceEngine::gpu_model`] by the host (the C API does).
+    #[cfg(feature = "cuda")]
+    pub fn load_gpu_model_from_parsed_gguf(gguf: &GgufFile, ordinal: usize, context: Option<usize>, model_name_hint: Option<&str>) -> Result<Self, String> {
+        Self::load_impl(gguf, 1, None, model_name_hint, Some((ordinal, context, false)))
+    }
+
+    /// The weights on the GPU, if the model was loaded there.
+    #[cfg(feature = "cuda")]
+    pub fn gpu_model(&self) -> Option<&std::sync::Arc<crate::gpu::GpuModel>> {
+        self.gpu_model.as_ref()
+    }
+
+    /// Times the device work of one decode token on the GPU at a context of `context` tokens (feature `cuda`): the positions before it are filled with a
+    /// fixed pseudo-random token sequence, then the token's CUDA graph is replayed `blocks` x `iterations` times. Returns the milliseconds per token of
+    /// every block. Weights are far larger than the L2 cache, so every replay streams them from device memory, as in generation.
+    #[cfg(feature = "cuda")]
+    pub fn time_gpu_decode(&mut self, context: usize, blocks: usize, iterations: usize) -> Result<Vec<f64>, String> {
+        if self.gpu.is_none() {
+            return Err("the model is not on the GPU".into());
+        }
+        if context == 0 || context > self.kv_cache.max_seq_len() {
+            return Err(format!("context must be 1..={}", self.kv_cache.max_seq_len()));
+        }
+        let vocab = self.model.config.vocab_size;
+        let mut logits = vec![0f32; vocab];
+        self.kv_cache.reset();
+        for pos in 0..context - 1 {
+            let token = ((pos * 7919 + 13) % vocab) as u32;
+            self.forward_token(token, pos, &mut logits)?;
+        }
+        let hidden = self.model.config.hidden_size;
+        let token = (((context - 1) * 7919 + 13) % vocab) as usize;
+        let row = self.model.token_embeddings[token * hidden..(token + 1) * hidden].to_vec();
+        let gpu = self.gpu.as_mut().expect("checked above");
+        gpu.time_token(&row, context - 1, blocks, iterations)
+    }
+
+    /// Name of the GPU the model runs on, or `None` for a model on the CPU.
+    pub fn gpu_device_name(&self) -> Option<String> {
+        #[cfg(feature = "cuda")]
+        if let Some(g) = &self.gpu_model {
+            return Some(g.device_name().to_string());
+        }
+        None
+    }
+
+    /// One forward pass of `token_id` at position `pos` on the CPU or the GPU, writing the logits of the next token. The positions before `pos` must
+    /// have been computed (in order) or still be in the cache; the generation methods do this themselves.
+    pub fn forward_token(&mut self, token_id: u32, pos: usize, logits: &mut [f32]) -> Result<(), String> {
+        #[cfg(feature = "cuda")]
+        if self.gpu.is_none() && self.gpu_model.is_some() {
+            return Err("the model was loaded onto the GPU without a session; create a session from `gpu_model()`".to_string());
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(gpu) = self.gpu.as_mut() {
+            let hidden = self.model.config.hidden_size;
+            let off = token_id as usize * hidden;
+            gpu.forward(&self.model.token_embeddings[off..off + hidden], pos, logits)?;
+            self.kv_cache.mark_position(pos);
+            return Ok(());
+        }
+        self.model.forward_token_with_scratchpad(token_id, pos, &mut self.kv_cache, &mut self.scratchpad, logits);
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn load_impl(
+        gguf: &GgufFile,
+        num_threads: usize,
+        force_kernel: Option<TernaryKernelType>,
+        model_name_hint: Option<&str>,
+        gpu_target: Option<(usize, Option<usize>, bool)>,
+    ) -> Result<Self, String> {
         let t0 = Instant::now();
+        #[cfg(feature = "cuda")]
+        let mut gpu: Option<crate::gpu::GpuDecoder> = None;
+        #[cfg(feature = "cuda")]
+        let mut gpu_model: Option<std::sync::Arc<crate::gpu::GpuModel>> = None;
 
         // 1. Detect architecture & hyperparameters from GGUF metadata, and reject a damaged or foreign file (absurd
         //    hyper-parameters, missing or wrongly sized tensors) before anything is indexed or allocated.
@@ -261,7 +367,41 @@ impl InferenceEngine {
         )?;
         progress!("    [{:.2?}] tokenizer ready", t0.elapsed());
 
-        let (model, kv_cache) = if matches!(config.architecture, ModelArchitecture::Qwen35 | ModelArchitecture::NemotronHMoe) {
+        let gpu_branch = gpu_target;
+        let (model, kv_cache) = if let Some((ordinal, limit, with_session)) = gpu_branch {
+            #[cfg(feature = "cuda")]
+            {
+                progress!("==> Loading the model onto the GPU...");
+                let weights = std::sync::Arc::new(crate::gpu::GpuModel::load(gguf, &config, ordinal, limit)?);
+                progress!("    [{:.2?}] weights on {}", t0.elapsed(), weights.device_name());
+                let token_embeddings = gguf
+                    .get_tensor_f16("token_embd.weight")
+                    .ok_or_else(|| "Missing token_embd.weight tensor".to_string())?
+                    .to_vec();
+                let output_norm = gguf.get_tensor_f32("output_norm.weight").ok_or_else(|| "Missing output_norm.weight tensor".to_string())?;
+                let kv = KVCache::try_new(1, weights.max_context(), 1, 2)?;
+                let model = QuintritModel {
+                    config: config.clone(),
+                    token_embeddings,
+                    blocks: Vec::new(),
+                    output_norm,
+                    lm_head: None,
+                    lm_head_f16: None,
+                    embedding_layer: None,
+                    hybrid: None,
+                };
+                if with_session {
+                    gpu = Some(crate::gpu::GpuDecoder::from_model(&weights)?);
+                }
+                gpu_model = Some(weights);
+                (model, kv)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (ordinal, limit, with_session);
+                return Err("this build has no GPU support (feature `cuda`)".to_string());
+            }
+        } else if matches!(config.architecture, ModelArchitecture::Qwen35 | ModelArchitecture::NemotronHMoe) {
             progress!("==> Loading hybrid layers ({:?})...", config.architecture);
             let output_norm = gguf
                 .get_tensor_f32("output_norm.weight")
@@ -407,7 +547,7 @@ impl InferenceEngine {
         }
 
         let sampler = Sampler::new(SamplingConfig::default());
-        let scratchpad = crate::scratchpad::InferenceScratchpad::new(&config, config.max_position_embeddings);
+        let scratchpad = crate::scratchpad::InferenceScratchpad::new(&config, if gpu_branch.is_some() { 1 } else { config.max_position_embeddings });
         progress!("    [{:.2?}] scratchpad allocated", t0.elapsed());
         let load_duration = t0.elapsed();
         progress!("==> Model successfully loaded in {:.2?}", load_duration);
@@ -423,6 +563,10 @@ impl InferenceEngine {
             cached_tokens: Vec::new(),
             cached_reset_count: 0,
             last_generation: GenerationStats::default(),
+            #[cfg(feature = "cuda")]
+            gpu,
+            #[cfg(feature = "cuda")]
+            gpu_model,
         })
     }
 
@@ -482,7 +626,7 @@ impl InferenceEngine {
         let t_prompt = Instant::now();
         let reused = self.reusable_prefix(&prompt_tokens);
         for (pos, &token_id) in prompt_tokens.iter().enumerate().skip(reused) {
-            self.model.forward_token_with_scratchpad(token_id, pos, &mut self.kv_cache, &mut self.scratchpad, &mut logits);
+            self.forward_token(token_id, pos, &mut logits)?;
             self.cached_tokens.push(token_id);
         }
         let prompt_ms = t_prompt.elapsed().as_secs_f64() * 1000.0;
@@ -517,7 +661,7 @@ impl InferenceEngine {
                 break;
             }
 
-            self.model.forward_token_with_scratchpad(next_token, current_pos, &mut self.kv_cache, &mut self.scratchpad, &mut logits);
+            self.forward_token(next_token, current_pos, &mut logits)?;
             self.cached_tokens.push(next_token);
             current_pos += 1;
         }
@@ -642,7 +786,7 @@ impl InferenceEngine {
         // 1. Measure Time to First Token (TTFT)
         let t_prompt_start = Instant::now();
         for (pos, &token_id) in prompt_tokens.iter().enumerate() {
-            self.model.forward_token_with_scratchpad(token_id, pos, &mut self.kv_cache, &mut self.scratchpad, &mut logits);
+            self.forward_token(token_id, pos, &mut logits)?;
         }
         let ttft = t_prompt_start.elapsed();
 
@@ -658,7 +802,7 @@ impl InferenceEngine {
             }
             let next_token = self.sampler.sample(&logits);
             generated_ids.push(next_token);
-            self.model.forward_token_with_scratchpad(next_token, current_pos, &mut self.kv_cache, &mut self.scratchpad, &mut logits);
+            self.forward_token(next_token, current_pos, &mut logits)?;
             current_pos += 1;
             count += 1;
         }

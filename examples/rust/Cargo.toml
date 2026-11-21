@@ -2,6 +2,7 @@
 #
 #   cargo run --release --bin gemv
 #   cargo run --release --bin generate -- path/to/model.gguf
+#   cargo run --release --features cuda --bin generate_gpu -- path/to/model.gguf     # on an NVIDIA GPU
 [package]
 name = "quintrit-examples"
 version = "0.0.0"
@@ -14,3 +15,12 @@ publish = false
 [dependencies]
 quintrit-core = { path = "../../rust/crates/quintrit-core" }
 quintrit-runtime = { path = "../../rust/crates/quintrit-runtime" }
+
+[features]
+# The NVIDIA GPU example (needs the CUDA toolkit to build): cargo run --release --features cuda --bin generate_gpu -- model.gguf
+cuda = ["quintrit-runtime/cuda"]
+
+[[bin]]
+name = "generate_gpu"
+path = "src/bin/generate_gpu.rs"
+required-features = ["cuda"]

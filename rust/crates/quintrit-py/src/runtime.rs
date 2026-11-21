@@ -165,14 +165,12 @@ impl GenState {
             }
         }
         let cfg = &eng.model.config;
-        if tokens.len() > cfg.max_position_embeddings {
+        // The window of the cache: the model's maximum on the CPU, the context of the GPU decoder on a GPU.
+        let window = eng.kv_cache.max_seq_len();
+        if tokens.len() > window {
             return Err(QError::new(
                 Kind::ContextOverflow,
-                format!(
-                    "the prompt has {} tokens but the context window holds {}",
-                    tokens.len(),
-                    cfg.max_position_embeddings
-                ),
+                format!("the prompt has {} tokens but the context window holds {}", tokens.len(), window),
             ));
         }
         let finish = if tokens.is_empty() { Some(Finish::Empty) } else { None };
@@ -193,15 +191,13 @@ impl GenState {
             detok_flushed: false,
             eos_id: eng.tokenizer.eos_token_id(),
             stop_at_eot: matches!(cfg.architecture, ModelArchitecture::BitNet | ModelArchitecture::Llama),
-            max_position: cfg.max_position_embeddings,
+            max_position: window,
         })
     }
 
     fn forward(&mut self, eng: &mut InferenceEngine, token: u32, pos: usize) -> Result<(), Fail> {
-        guard("forward pass", || {
-            let InferenceEngine { model, kv_cache, scratchpad, .. } = eng;
-            model.forward_token_with_scratchpad(token, pos, kv_cache, scratchpad, &mut self.logits);
-        })?;
+        let result = guard("forward pass", || eng.forward_token(token, pos, &mut self.logits))?;
+        result.map_err(|m| QError::new(Kind::Device, m))?;
         Ok(())
     }
 
@@ -492,6 +488,26 @@ pub struct PyModel {
     path: PathBuf,
     kernel: Kernel,
     threads: AtomicUsize,
+    /// The GPU the model runs on (`None`: the CPU).
+    device: Option<usize>,
+}
+
+/// Parses the `device` argument: `None` / `"cpu"` is the CPU, `"cuda"` is GPU 0, `"cuda:<n>"` is GPU `n`.
+fn parse_device(device: Option<&str>) -> QResult<Option<usize>> {
+    let Some(d) = device else { return Ok(None) };
+    let d = d.trim().to_ascii_lowercase();
+    if d == "cpu" || d.is_empty() {
+        return Ok(None);
+    }
+    match d.strip_prefix("cuda") {
+        Some("") => Ok(Some(0)),
+        Some(rest) => rest
+            .strip_prefix(':')
+            .and_then(|n| n.parse::<usize>().ok())
+            .map(Some)
+            .ok_or_else(|| QError::new(Kind::InvalidArgument, format!("unknown device {d:?}: use \"cpu\", \"cuda\" or \"cuda:<index>\""))),
+        None => Err(QError::new(Kind::InvalidArgument, format!("unknown device {d:?}: use \"cpu\", \"cuda\" or \"cuda:<index>\""))),
+    }
 }
 
 /// Resolves a model path: a file, or a directory holding `ggml-model-i2_s.gguf` (or exactly one `.gguf` file).
@@ -529,8 +545,20 @@ impl PyModel {
     /// multi-gigabyte models and releases the GIL. Loading is silent; `verbose=True` prints progress lines to the
     /// standard output of the process (the C-level stream, not `sys.stdout`).
     #[staticmethod]
-    #[pyo3(signature = (path, *, threads = None, kernel = None, verbose = false))]
-    fn load(py: Python<'_>, path: PathBuf, threads: Option<usize>, kernel: Option<&str>, verbose: bool) -> PyResult<PyModel> {
+    #[pyo3(signature = (path, *, threads = None, kernel = None, verbose = false, device = None, context = None))]
+    fn load(
+        py: Python<'_>,
+        path: PathBuf,
+        threads: Option<usize>,
+        kernel: Option<&str>,
+        verbose: bool,
+        device: Option<&str>,
+        context: Option<usize>,
+    ) -> PyResult<PyModel> {
+        let gpu = parse_device(device)?;
+        if gpu.is_none() && context.is_some() {
+            return Err(QError::new(Kind::InvalidArgument, "context only applies to device=\"cuda\" (the CPU uses the model's context window)").into());
+        }
         let threads = resolve_threads(threads)?;
         let kernel = Kernel::parse(kernel)?;
         let path = resolve_model_path(path)?;
@@ -538,16 +566,33 @@ impl PyModel {
             .detach(|| {
                 guard("model loading", || {
                     let _verbose = VerboseScope::new(verbose);
-                    InferenceEngine::load_from_gguf(&path, threads, Some(kernel.runtime_kind()))
+                    match gpu {
+                        None => InferenceEngine::load_from_gguf(&path, threads, Some(kernel.runtime_kind())),
+                        #[cfg(feature = "cuda")]
+                        Some(ordinal) => InferenceEngine::load_from_gguf_on_gpu(&path, ordinal, context),
+                        #[cfg(not(feature = "cuda"))]
+                        Some(_) => {
+                            let _ = context;
+                            Err("this build of quintrit has no GPU support (it was built without the cargo feature `cuda`)".to_string())
+                        }
+                    }
                 })
             })
             .map_err(|e| PyErr::from(QError::new(Kind::ModelLoad, e.msg)))?
-            .map_err(|e| QError::new(Kind::ModelLoad, format!("{}: {e}", path.display())))?;
+            .map_err(|e| {
+                let kind = if gpu.is_some() && (e.contains("GPU support") || e.contains("CUDA devices found") || e.contains("CUDA driver") || e.contains("unsupported GPU") || e.contains("GPU kernels")) {
+                    Kind::Device
+                } else {
+                    Kind::ModelLoad
+                };
+                QError::new(kind, format!("{}: {e}", path.display()))
+            })?;
         Ok(PyModel {
             shared: Arc::new(Shared { engine: Mutex::new(engine), epoch: AtomicU64::new(0) }),
             path,
             kernel,
-            threads: AtomicUsize::new(threads),
+            threads: AtomicUsize::new(if gpu.is_some() { 0 } else { threads }),
+            device: gpu,
         })
     }
 
@@ -559,7 +604,22 @@ impl PyModel {
     /// Kernel the weights were transcoded for.
     #[getter]
     fn kernel(&self) -> &'static str {
-        self.kernel.name()
+        if self.device.is_some() { "cuda" } else { self.kernel.name() }
+    }
+
+    /// Where the model runs: `"cpu"` or `"cuda:<index>"`.
+    #[getter]
+    fn device(&self) -> String {
+        match self.device {
+            Some(i) => format!("cuda:{i}"),
+            None => "cpu".to_string(),
+        }
+    }
+
+    /// Positions of the context window (on a GPU the window the decoder was created with, on the CPU the model's maximum).
+    #[getter]
+    fn context_window(&self) -> usize {
+        self.shared.lock().kv_cache.max_seq_len()
     }
 
     /// Worker threads used by the matrix kernels (assignable).
@@ -570,6 +630,9 @@ impl PyModel {
 
     #[setter]
     fn set_threads(&self, py: Python<'_>, threads: usize) -> PyResult<()> {
+        if self.device.is_some() {
+            return Err(QError::new(Kind::InvalidArgument, "threads has no effect on a model on the GPU").into());
+        }
         let threads = resolve_threads(Some(threads))?;
         py.detach(|| self.shared.lock().set_num_threads(threads));
         self.threads.store(threads, Ordering::Relaxed);
@@ -723,7 +786,7 @@ impl PyModel {
         let out = py
             .detach(|| -> QResult<Vec<f32>> {
                 let mut eng = self.shared.lock();
-                let (vocab, max_pos) = (eng.model.config.vocab_size, eng.model.config.max_position_embeddings);
+                let (vocab, max_pos) = (eng.model.config.vocab_size, eng.kv_cache.max_seq_len());
                 let ids = match input {
                     Input::Ids(ids) => ids,
                     Input::Text(text) => {
@@ -754,12 +817,13 @@ impl PyModel {
                 self.shared.epoch.fetch_add(1, Ordering::SeqCst);
                 eng.kv_cache.reset();
                 let mut logits = vec![0.0f32; vocab];
-                guard("forward pass", || {
-                    let InferenceEngine { model, kv_cache, scratchpad, .. } = &mut *eng;
+                let result = guard("forward pass", || -> Result<(), String> {
                     for (pos, &id) in ids.iter().enumerate() {
-                        model.forward_token_with_scratchpad(id, pos, kv_cache, scratchpad, &mut logits);
+                        eng.forward_token(id, pos, &mut logits)?;
                     }
+                    Ok(())
                 })?;
+                result.map_err(|m| QError::new(Kind::Device, m))?;
                 Ok(logits)
             })
             .map_err(PyErr::from)?;
@@ -769,11 +833,12 @@ impl PyModel {
     fn __repr__(&self) -> String {
         let eng = self.shared.lock();
         format!(
-            "Model(path={:?}, architecture={:?}, layers={}, kernel={:?}, threads={})",
+            "Model(path={:?}, architecture={:?}, layers={}, device={:?}, kernel={:?}, threads={})",
             self.path.display().to_string(),
             architecture_name(eng.model.config.architecture),
             eng.model.config.num_hidden_layers,
-            self.kernel.name(),
+            self.device(),
+            self.kernel(),
             self.threads.load(Ordering::Relaxed)
         )
     }

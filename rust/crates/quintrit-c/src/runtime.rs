@@ -8,6 +8,8 @@ use crate::error::{
     QUINTRIT_ERR_INVALID_ARGUMENT, QUINTRIT_ERR_INVALID_VALUE, QUINTRIT_ERR_MODEL,
     QUINTRIT_ERR_UNSUPPORTED,
 };
+#[cfg(feature = "cuda")]
+use crate::error::QUINTRIT_ERR_DEVICE;
 use crate::kernel::{resolve, resolve_threads, Kernel, QUINTRIT_KERNEL_AUTO};
 use crate::util::{
     c_str, check_handle, check_out_struct, in_slice, out_ptr, out_slice, read_versioned, text, write_out, HasMagic,
@@ -152,6 +154,9 @@ pub struct ModelInner {
     tokenizer: QuintritTokenizer,
     kernel: Kernel,
     threads: usize,
+    /// The weights on the GPU when the model was opened with `quintrit_model_open_gpu` (the CPU weights are then absent).
+    #[cfg(feature = "cuda")]
+    gpu: Option<Arc<quintrit_runtime::gpu::GpuModel>>,
 }
 
 /// Opaque handle `quintrit_model_t`.
@@ -167,6 +172,9 @@ struct SessionState {
     scratch: InferenceScratchpad,
     logits: Vec<f32>,
     ctx_len: usize,
+    /// The device state (KV cache, buffers, graph) of a session of a GPU model; `kv` is then only the bookkeeping of the positions.
+    #[cfg(feature = "cuda")]
+    gpu: Option<quintrit_runtime::gpu::GpuSession>,
 }
 
 /// Opaque handle `quintrit_session_t`.
@@ -193,8 +201,10 @@ impl HasMagic for SessionHandle {
 // The C API promises that a model may be used from several threads; fail the build if that stops being true.
 const _: fn() = || {
     fn is_send_sync<T: Send + Sync>() {}
+    fn is_send<T: Send>() {}
     is_send_sync::<ModelInner>();
-    is_send_sync::<SessionState>();
+    // A session is used by one thread at a time (its mutex), so it only has to be movable between threads.
+    is_send::<SessionState>();
 };
 
 fn model_arc(h: &ModelHandle) -> Arc<ModelInner> {
@@ -269,8 +279,73 @@ fn open_model(path: &str, opts: Option<ModelOptions>) -> Res<ModelHandle> {
     let InferenceEngine { model, tokenizer, .. } = engine;
     Ok(ModelHandle {
         magic: MAGIC_MODEL,
-        inner: Mutex::new(Arc::new(ModelInner { model, tokenizer, kernel, threads })),
+        inner: Mutex::new(Arc::new(ModelInner {
+            model,
+            tokenizer,
+            kernel,
+            threads,
+            #[cfg(feature = "cuda")]
+            gpu: None,
+        })),
     })
+}
+
+/// Device kinds of `quintrit_model_device`.
+pub const QUINTRIT_DEVICE_CPU: i32 = 0;
+pub const QUINTRIT_DEVICE_CUDA: i32 = 1;
+
+/// `quintrit_gpu_options_t`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct GpuOptions {
+    pub struct_size: u32,
+    /// Index of the GPU in the driver's enumeration.
+    pub device_index: u32,
+    /// Largest context window a session of the model can have, in tokens; 0 = the default (4096 or the model's maximum, whichever is smaller).
+    pub context_length: u32,
+    /// `QUINTRIT_MODEL_OPEN_VERBOSE` or 0.
+    pub flags: u32,
+}
+
+/// Loads a model onto a GPU (feature `cuda`).
+#[cfg(feature = "cuda")]
+fn open_gpu_model(path: &str, opts: Option<GpuOptions>) -> Res<ModelHandle> {
+    let (device, context, flags) = opts.map_or((0, 0, 0), |o| (o.device_index, o.context_length, o.flags));
+    if flags & !QUINTRIT_MODEL_OPEN_VERBOSE != 0 {
+        fail!(QUINTRIT_ERR_INVALID_ARGUMENT, "options.flags has unknown bits set: {flags:#x}");
+    }
+    let gguf = crate::gguf_check::open_checked(Path::new(path))?;
+    validate_model(&gguf)?;
+    let engine = {
+        let _verbose = VerboseScope::new(flags & QUINTRIT_MODEL_OPEN_VERBOSE != 0);
+        InferenceEngine::load_gpu_model_from_parsed_gguf(&gguf, device as usize, (context != 0).then_some(context as usize), Some(path)).map_err(|m| {
+            // The decoder reports unsupported models and GPU problems in plain text; sort them into the two classes a caller can act on.
+            let code = if m.contains("run on the CPU only") || m.contains("not supported") || m.contains("not F16") || m.contains("numerics") { QUINTRIT_ERR_UNSUPPORTED }
+                else if m.contains("CUDA") || m.contains("GPU") || m.contains("device") { QUINTRIT_ERR_DEVICE }
+                else { QUINTRIT_ERR_MODEL };
+            Failure::new(code, m)
+        })?
+    };
+    let weights = engine.gpu_model().cloned();
+    let InferenceEngine { model, tokenizer, .. } = engine;
+    Ok(ModelHandle {
+        magic: MAGIC_MODEL,
+        inner: Mutex::new(Arc::new(ModelInner { model, tokenizer, kernel: Kernel::Simd32, threads: 0, gpu: weights })),
+    })
+}
+
+/// One forward pass of a session on its device.
+fn forward_one(model: &ModelInner, st: &mut SessionState, token: u32, pos: usize) -> Res<()> {
+    #[cfg(feature = "cuda")]
+    if let Some(gpu) = st.gpu.as_mut() {
+        let hidden = model.model.config.hidden_size;
+        let off = token as usize * hidden;
+        gpu.forward(&model.model.token_embeddings[off..off + hidden], pos, &mut st.logits).map_err(|m| Failure::new(QUINTRIT_ERR_DEVICE, m))?;
+        st.kv.mark_position(pos);
+        return Ok(());
+    }
+    model.model.forward_token_with_scratchpad(token, pos, &mut st.kv, &mut st.scratch, &mut st.logits);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -351,7 +426,7 @@ fn generate(
     let llama_like = matches!(model.model.config.architecture, ModelArchitecture::BitNet | ModelArchitecture::Llama);
 
     for (i, &tok) in tokens.iter().enumerate() {
-        model.model.forward_token_with_scratchpad(tok, pos0 + i, &mut st.kv, &mut st.scratch, &mut st.logits);
+        forward_one(&model, st, tok, pos0 + i)?;
     }
     let mut pos = pos0 + tokens.len();
 
@@ -406,7 +481,7 @@ fn generate(
             break;
         }
         // Feed the token (also after a callback stop, so that the cache matches the text the caller has seen).
-        model.model.forward_token_with_scratchpad(next, pos, &mut st.kv, &mut st.scratch, &mut st.logits);
+        forward_one(&model, st, next, pos)?;
         pos += 1;
         if halt {
             break;
@@ -528,7 +603,7 @@ pub unsafe extern "C" fn quintrit_model_info(model: *const ModelHandle, out_info
         }
         let info = ModelInfo {
             struct_size: size_of::<ModelInfo>() as u32,
-            kernel: m.kernel.id(),
+            kernel: if model_is_gpu(&m) { QUINTRIT_KERNEL_AUTO } else { m.kernel.id() },
             num_threads: m.threads as u32,
             num_layers: c.num_hidden_layers as u32,
             hidden_size: c.hidden_size as u32,
@@ -702,6 +777,27 @@ pub unsafe extern "C" fn quintrit_session_create(
         unsafe { out_session.write(std::ptr::null_mut()) };
         let m = model_arc(h);
         let c = &m.model.config;
+        #[cfg(feature = "cuda")]
+        if let Some(weights) = &m.gpu {
+            let ctx = match opts.map_or(0, |o| o.context_length as usize) {
+                0 => weights.max_context(),
+                n if n <= weights.max_context() => n,
+                n => fail!(QUINTRIT_ERR_INVALID_ARGUMENT, "context_length {n} exceeds the GPU context of the model ({})", weights.max_context()),
+            };
+            let session = weights.new_session(Some(ctx)).map_err(|m| Failure::new(QUINTRIT_ERR_DEVICE, m))?;
+            let ctx = session.context();
+            let state = SessionState {
+                kv: KVCache::try_new(1, ctx, 1, 2).map_err(|m| Failure::new(QUINTRIT_ERR_INVALID_ARGUMENT, m))?,
+                scratch: InferenceScratchpad::new(c, 1),
+                logits: vec![0.0; c.vocab_size],
+                ctx_len: ctx,
+                model: m.clone(),
+                gpu: Some(session),
+            };
+            let handle = Box::new(SessionHandle { magic: MAGIC_SESSION, state: Mutex::new(state) });
+            unsafe { out_session.write(Box::into_raw(handle)) };
+            return Ok(());
+        }
         let max_ctx = c.max_position_embeddings;
         let ctx = match opts.map_or(0, |o| o.context_length as usize) {
             0 => max_ctx,
@@ -722,6 +818,8 @@ pub unsafe extern "C" fn quintrit_session_create(
             logits: vec![0.0; c.vocab_size],
             ctx_len: ctx,
             model: m.clone(),
+            #[cfg(feature = "cuda")]
+            gpu: None,
         };
         let handle = Box::new(SessionHandle { magic: MAGIC_SESSION, state: Mutex::new(state) });
         unsafe { out_session.write(Box::into_raw(handle)) };
@@ -898,6 +996,81 @@ pub unsafe extern "C" fn quintrit_session_generate(
         }
         if let Some(r) = result_ptr {
             unsafe { r.write(g.result) };
+        }
+        Ok(())
+    })
+}
+
+fn model_is_gpu(m: &ModelInner) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        m.gpu.is_some()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = m;
+        false
+    }
+}
+
+/// Loads a GGUF model onto an NVIDIA GPU. The ternary weights are transcoded into the GPU layout while the file is read; sessions of the model keep their
+/// KV cache on the device, and generation uses the same functions as for a CPU model, with results bit-identical to the CPU path. Supported are the `I2_S`
+/// models (not the block-scaled `Q2_0`, mixture-of-experts or hybrid models; `QUINTRIT_ERR_UNSUPPORTED`). A GPU of compute capability 8.0 or newer is
+/// needed (`QUINTRIT_ERR_UNSUPPORTED` otherwise). Without GPU support in this build of the library, or without a CUDA driver, the call fails with
+/// `QUINTRIT_ERR_UNSUPPORTED` or `QUINTRIT_ERR_DEVICE`. `options` may be NULL (device 0, default context).
+///
+/// # Safety
+/// `path` is a NUL-terminated UTF-8 path; `options` is NULL or a `quintrit_gpu_options_t` with `struct_size` set; `out_model` points to a handle pointer,
+/// which is set to NULL on failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn quintrit_model_open_gpu(path: *const c_char, options: *const GpuOptions, out_model: *mut *mut ModelHandle) -> c_int {
+    guard(|| {
+        // SAFETY: validated by c_str / read_versioned / out_ptr.
+        let path = unsafe { c_str(path, "path")? };
+        let opts = unsafe { read_versioned(options, "options")? };
+        out_ptr(out_model, "out_model")?;
+        unsafe { out_model.write(std::ptr::null_mut()) };
+        #[cfg(feature = "cuda")]
+        {
+            let handle = Box::new(open_gpu_model(path, opts)?);
+            unsafe { out_model.write(Box::into_raw(handle)) };
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (path, opts);
+            fail!(QUINTRIT_ERR_UNSUPPORTED, "this build of the library has no GPU support (build quintrit-c with the feature `cuda`)")
+        }
+    })
+}
+
+/// Reports where a model runs: `QUINTRIT_DEVICE_CPU` or `QUINTRIT_DEVICE_CUDA`, and the GPU index (0 for the CPU). `out_index` may be NULL.
+///
+/// # Safety
+/// `model` is a live handle; `out_device` points to an `int32_t`; `out_index` is NULL or points to a `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn quintrit_model_device(model: *const ModelHandle, out_device: *mut i32, out_index: *mut u32) -> c_int {
+    guard(|| {
+        // SAFETY: validated by check_handle / write_out.
+        let h = unsafe { check_handle(model, "model")? };
+        let m = model_arc(h);
+        let (device, index) = {
+            #[cfg(feature = "cuda")]
+            {
+                match &m.gpu {
+                    Some(g) => (QUINTRIT_DEVICE_CUDA, g.device_ordinal() as u32),
+                    None => (QUINTRIT_DEVICE_CPU, 0),
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = &m;
+                (QUINTRIT_DEVICE_CPU, 0u32)
+            }
+        };
+        unsafe { write_out(out_device, device, "out_device")? };
+        if !out_index.is_null() {
+            unsafe { write_out(out_index, index, "out_index")? };
         }
         Ok(())
     })

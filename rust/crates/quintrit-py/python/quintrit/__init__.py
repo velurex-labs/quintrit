@@ -4,7 +4,8 @@ Three levels are available:
 
 * kernels: :func:`pack`, :func:`unpack`, :func:`gemv`, :class:`PackedMatrix` (numpy in, numpy out);
 * format: :func:`open` / :class:`GgufFile` to inspect GGUF files and extract or transcode ternary tensors;
-* runtime: :class:`Model` for tokenizing and generating text with a ternary GGUF language model.
+* runtime: :class:`Model` for tokenizing and generating text with a ternary GGUF language model, on the CPU or (build with the cargo feature
+  ``cuda``) on an NVIDIA GPU: ``Model.load(path, device="cuda")``.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import numpy as np
 
 from ._errors import (
     ContextOverflowError,
+    DeviceError,
     DTypeError,
     FormatError,
     GenerationError,
@@ -44,6 +46,8 @@ from ._native import (
     available_kernels,
     best_kernel,
     cpu_features,
+    cuda_built,
+    cuda_devices,
     default_threads,
     gemv,
     open,
@@ -62,6 +66,8 @@ __all__ = [
     "best_kernel",
     "cpu_features",
     "default_threads",
+    "cuda_built",
+    "cuda_devices",
     # format level
     "open",
     "GgufFile",
@@ -89,6 +95,7 @@ __all__ = [
     "GenerationError",
     "StaleStreamError",
     "ContextOverflowError",
+    "DeviceError",
     "InternalError",
 ]
 

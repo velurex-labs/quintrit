@@ -35,6 +35,11 @@ OPTIONS:
     --kernel <KERNEL>       Target ternary GEMV kernel implementation:
                             - quintrit:      Quintrit 1.60 bpw Velurex 32-row tiled activation LUT (default)
                             - quintrit_512: Quintrit 1.60 bpw 64-row tiled activation LUT on AVX-512
+    --device <DEVICE>       Where the model runs (default: cpu):
+                            - cpu:       the CPU kernels above
+                            - cuda[:N]:  NVIDIA GPU N (default 0; compute capability 8.0 or newer; build with
+                                         `--features cuda`). Results are bit-identical to the CPU path.
+    --context <N>           Context window in tokens on the GPU (default 4096, at most 7936)
     --bench                 Run benchmark pass (measures TTFT, tokens/sec, memory bandwidth)
     --chat                  Enter interactive multi-turn chat session
     --stop <TEXT>           Additional stop sequence to halt generation (can be repeated)
@@ -67,6 +72,8 @@ fn main() {
     let mut top_k: usize = 40;
     let mut top_p: f32 = 0.9;
     let mut target_kernel = TernaryKernelType::QuintritLut;
+    let mut gpu_device: Option<usize> = None;
+    let mut gpu_context: Option<usize> = None;
     let mut num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -135,6 +142,33 @@ fn main() {
                     num_threads = args[i].parse().unwrap_or(num_threads);
                 }
             }
+            "--device" => {
+                i += 1;
+                if i < args.len() {
+                    let d = args[i].to_ascii_lowercase();
+                    if d == "cpu" {
+                        gpu_device = None;
+                    } else if let Some(rest) = d.strip_prefix("cuda") {
+                        let ordinal = rest.strip_prefix(':').map(|n| n.parse::<usize>()).unwrap_or(Ok(0));
+                        match ordinal {
+                            Ok(n) => gpu_device = Some(n),
+                            Err(_) => {
+                                eprintln!("Invalid device '{}': use cpu, cuda or cuda:<N>.", d);
+                                exit(1);
+                            }
+                        }
+                    } else {
+                        eprintln!("Unknown device '{}': use cpu, cuda or cuda:<N>.", d);
+                        exit(1);
+                    }
+                }
+            }
+            "--context" => {
+                i += 1;
+                if i < args.len() {
+                    gpu_context = args[i].parse().ok();
+                }
+            }
             "--bench" => {
                 run_bench = true;
             }
@@ -186,8 +220,23 @@ fn main() {
     }
 
     // Load inference engine and transcode into RAM
-    let mut engine = match InferenceEngine::load_from_gguf(&model_path, num_threads, Some(target_kernel)) {
-        Ok(eng) => eng,
+    let loaded = match gpu_device {
+        None => InferenceEngine::load_from_gguf(&model_path, num_threads, Some(target_kernel)),
+        #[cfg(feature = "cuda")]
+        Some(ordinal) => InferenceEngine::load_from_gguf_on_gpu(&model_path, ordinal, gpu_context),
+        #[cfg(not(feature = "cuda"))]
+        Some(_) => {
+            let _ = gpu_context;
+            Err("this build of `quintrit` has no GPU support; rebuild with `--features cuda`".to_string())
+        }
+    };
+    let mut engine = match loaded {
+        Ok(eng) => {
+            if let Some(name) = eng.gpu_device_name() {
+                println!("  Device:          {} (CUDA)", name);
+            }
+            eng
+        }
         Err(err) => {
             eprintln!("Failed to load GGUF model: {}", err);
             exit(1);

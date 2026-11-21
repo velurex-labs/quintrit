@@ -85,6 +85,7 @@ extern "C" {
 #define QUINTRIT_ERR_BUSY               12  /* the handle is used by another thread, or the operation needs it idle */
 #define QUINTRIT_ERR_INTERNAL           13  /* a caught internal panic */
 #define QUINTRIT_ERR_INVALID_HANDLE     14  /* a handle is NULL, of the wrong type, or freed */
+#define QUINTRIT_ERR_DEVICE             15  /* a call to the GPU failed (driver error, out of device memory) */
 
 /* Returns a static, NUL-terminated description of a status code. Never NULL. */
 QUINTRIT_API const char* quintrit_status_string(int status);
@@ -470,6 +471,63 @@ QUINTRIT_API int quintrit_session_generate(quintrit_session_t* session, const ch
                                            const quintrit_generate_params_t* params, quintrit_token_callback callback,
                                            void* user_data, char* out, size_t out_capacity, size_t* out_len,
                                            quintrit_generate_result_t* result);
+
+/* ----------------------------------------------------------------------------------------------------------------- */
+/* NVIDIA GPU (library built with the cargo feature `cuda`)                                                           */
+/* ----------------------------------------------------------------------------------------------------------------- */
+
+/*
+ * The GPU functions exist in every build of the library. A build without GPU support returns QUINTRIT_ERR_UNSUPPORTED
+ * from all of them, so one program works against both builds and can fall back to the CPU. A build with GPU support
+ * loads the CUDA driver at run time: on a machine without an NVIDIA driver quintrit_cuda_device_count reports 0.
+ * GPUs of compute capability 8.0 (Ampere: A100, RTX 30xx) or newer are supported.
+ */
+
+/* quintrit_model_device: where a model runs. */
+#define QUINTRIT_DEVICE_CPU   0
+#define QUINTRIT_DEVICE_CUDA  1
+
+typedef struct quintrit_cuda_device_info {
+    uint32_t struct_size;     /* set to sizeof(quintrit_cuda_device_info_t) before the call */
+    uint32_t index;           /* index of the GPU in the driver's enumeration */
+    int32_t  compute_major;   /* compute capability */
+    int32_t  compute_minor;
+    uint32_t sm_count;        /* streaming multiprocessors */
+    uint32_t supported;       /* 1 if the GPU can run the kernels (compute capability >= 8.0), else 0 */
+    uint64_t total_memory;    /* device memory in bytes */
+    uint64_t l2_cache_bytes;
+    char     name[64];        /* marketing name, NUL-terminated */
+} quintrit_cuda_device_info_t;
+
+typedef struct quintrit_gpu_options {
+    uint32_t struct_size;     /* set to sizeof(quintrit_gpu_options_t) */
+    uint32_t device_index;    /* GPU to use (quintrit_cuda_device_info_t::index) */
+    uint32_t context_length;  /* largest context window of a session in tokens; 0 = min(4096, the model's maximum). At most 7936. */
+    uint32_t flags;           /* QUINTRIT_MODEL_OPEN_VERBOSE or 0 */
+} quintrit_gpu_options_t;
+
+/* Number of NVIDIA GPUs (0 without a driver). QUINTRIT_ERR_UNSUPPORTED if the library has no GPU support. */
+QUINTRIT_API int quintrit_cuda_device_count(uint32_t* out_count);
+
+/* Describes GPU `index` (below the count). QUINTRIT_ERR_INVALID_ARGUMENT for an index that does not exist. */
+QUINTRIT_API int quintrit_cuda_device_info(uint32_t index, quintrit_cuda_device_info_t* out_info);
+
+/*
+ * Loads a GGUF model onto a GPU. The ternary weights are transcoded into the GPU layout while the file is read; the
+ * returned handle is used with quintrit_model_tokenize, quintrit_session_create, quintrit_session_generate and the other
+ * runtime functions exactly like a CPU model. Every session of the model keeps its KV cache on the GPU (about
+ * 2 * layers * kv_heads * context * head_dim * 2 bytes) and uses the model's weights. Results are bit-identical to the
+ * CPU path (greedy decoding gives the same tokens and logits). Supported are the I2_S models (BitNet b1.58, Falcon3,
+ * Falcon-E, LLaMA-style); block-scaled Q2_0, mixture-of-experts and hybrid models return QUINTRIT_ERR_UNSUPPORTED, as
+ * does a GPU of compute capability below 8.0. QUINTRIT_ERR_DEVICE for driver errors and out of device memory.
+ * quintrit_model_info reports kernel 0 and 0 threads for a GPU model; quintrit_model_set_threads has no effect on it.
+ * Session context lengths are rounded down to a multiple of 256 tokens. `options` may be NULL (GPU 0, default context).
+ * On failure *out_model is NULL.
+ */
+QUINTRIT_API int quintrit_model_open_gpu(const char* path, const quintrit_gpu_options_t* options, quintrit_model_t** out_model);
+
+/* Where a model runs: QUINTRIT_DEVICE_CPU or QUINTRIT_DEVICE_CUDA, and the GPU index (0 for the CPU). out_index may be NULL. */
+QUINTRIT_API int quintrit_model_device(const quintrit_model_t* model, int32_t* out_device, uint32_t* out_index);
 
 #ifdef __cplusplus
 }

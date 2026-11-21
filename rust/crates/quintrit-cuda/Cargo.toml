@@ -1,0 +1,17 @@
+[package]
+name = "quintrit-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Optional NVIDIA GPU backend of Quintrit: CUDA kernels for velurex-encoded ternary matrices, loaded through the CUDA driver at run time"
+build = "build.rs"
+
+[dependencies]
+quintrit-core = { path = "../quintrit-core", version = "0.2.0" }
+# Loads the CUDA driver library (libcuda.so.1, nvcuda.dll) at run time; nothing of NVIDIA is linked at build time.
+libloading = "0.8"

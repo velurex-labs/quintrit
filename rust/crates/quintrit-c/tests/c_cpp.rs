@@ -19,9 +19,15 @@ fn crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// `target/<profile>` of the running test executable.
+/// `target/<profile>` of the running test executable. Cargo puts test executables into `target/<profile>/deps/` or, with the newer build-directory
+/// layout, into `target/<profile>/build/<package>/<hash>/out/`; the nearest `deps` or `build` ancestor tells which.
 fn profile_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
+    for dir in exe.ancestors().skip(1) {
+        if matches!(dir.file_name().and_then(|n| n.to_str()), Some("deps" | "build")) {
+            return dir.parent().unwrap().to_path_buf();
+        }
+    }
     exe.parent().unwrap().parent().unwrap().to_path_buf()
 }
 

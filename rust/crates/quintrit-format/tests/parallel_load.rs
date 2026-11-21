@@ -201,6 +201,25 @@ fn fused_transcoder_matches_the_separate_steps() {
 }
 
 #[test]
+fn planar_transcoder_matches_decode_then_pack() {
+    use quintrit_format::transcode_to_planar;
+    for ty in [quintrit_format::GGML_TYPE_I2_S, GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0] {
+        let decoder = get_ternary_decoder(ty).unwrap();
+        // Row counts that are no multiple of a tile or of the 32-row conversion chunk, and column counts with a partial last block.
+        for cols in [256usize, 3072, 3200, 5120] {
+            for rows in [2usize, 6, 40, 64, 100, big_shape(cols).0] {
+                let data = payload(ty, rows, cols);
+                let trits = decoder.unpack_trits(&data, rows, cols).unwrap();
+                assert_eq!(transcode_to_planar(decoder, &data, rows, cols).unwrap(), pack_matrix(&trits, rows, cols), "type {ty} {rows}x{cols}");
+            }
+        }
+    }
+    let decoder = get_ternary_decoder(GGML_TYPE_TQ2_0).unwrap();
+    let data = payload(GGML_TYPE_TQ2_0, 64, 256);
+    assert!(transcode_to_planar(decoder, &data[..data.len() - 1], 64, 256).is_err(), "short payload");
+}
+
+#[test]
 fn fused_transcoder_rejects_bad_shapes() {
     use quintrit_format::transcode_to_tiled;
     let decoder = get_ternary_decoder(GGML_TYPE_TQ2_0).unwrap();

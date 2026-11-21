@@ -103,5 +103,9 @@ class ContextOverflowError(GenerationError, ValueError):
     """The prompt does not fit into the model's context window."""
 
 
+class DeviceError(QuintritError, RuntimeError):
+    """A call to the GPU failed (no NVIDIA driver, no supported GPU, out of device memory), or this build has no GPU support."""
+
+
 class InternalError(QuintritError, RuntimeError):
     """An unexpected failure inside the native code (a bug); the message names the failing operation."""

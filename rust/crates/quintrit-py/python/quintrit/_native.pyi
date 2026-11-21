@@ -27,6 +27,13 @@ def cpu_features() -> dict[str, bool]:
 def default_threads() -> int:
     """Number of logical CPUs (at most 256)."""
 
+def cuda_built() -> bool:
+    """True if this build of the extension has GPU support (compiled with the cargo feature ``cuda``)."""
+
+def cuda_devices() -> list[dict[str, Any]]:
+    """The NVIDIA GPUs the driver reports: dicts with ``index``, ``name``, ``compute_capability`` (a ``(major, minor)`` tuple),
+    ``multiprocessors``, ``memory_bytes`` and ``supported`` (compute capability 8.0 or newer). Empty without a driver or without GPU support."""
+
 class PackedMatrix:
     """A ternary matrix packed at 5 trits per byte (1.60 bits per weight)."""
 
@@ -185,9 +192,20 @@ class Model:
         threads: Optional[int] = None,
         kernel: Optional[KernelName] = None,
         verbose: bool = False,
-    ) -> "Model": ...
+        device: Optional[str] = None,
+        context: Optional[int] = None,
+    ) -> "Model":
+        """Loads a model. ``device`` is ``None`` / ``"cpu"``, ``"cuda"`` (GPU 0) or ``"cuda:<index>"`` (needs a build with GPU support, an NVIDIA GPU
+        of compute capability 8.0 or newer and an ``I2_S`` model); ``context`` bounds the context window on a GPU (default 4096, at most 7936).
+        On a GPU ``threads`` and ``kernel`` are ignored."""
     @property
     def path(self) -> str: ...
+    @property
+    def device(self) -> str:
+        """``"cpu"`` or ``"cuda:<index>"``."""
+    @property
+    def context_window(self) -> int:
+        """Positions of the context window in use."""
     @property
     def kernel(self) -> str: ...
     @property
