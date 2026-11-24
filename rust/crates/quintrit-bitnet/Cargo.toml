@@ -8,7 +8,6 @@ readme = "README.md"
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-publish = false
 description = "Faithful Rust transcription of Microsoft BitNet's 4-trit kernels (2.00 bpw), the comparison baseline for the quintrit kernels"
 
 [dependencies]

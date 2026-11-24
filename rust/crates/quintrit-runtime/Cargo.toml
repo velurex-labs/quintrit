@@ -18,8 +18,8 @@ ahash = "0.8"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Comparison baseline (Rust only, not published): the BitNet kernels, enabled with the feature `bitnet-baseline`.
-quintrit-bitnet = { path = "../quintrit-bitnet", optional = true }
+# Comparison baseline (Rust only): the BitNet kernels, enabled with the feature `bitnet-baseline`.
+quintrit-bitnet = { path = "../quintrit-bitnet", version = "0.2.0", optional = true }
 # NVIDIA GPU backend (needs the CUDA driver at run time and the CUDA toolkit to build the kernels), enabled with the feature `cuda`.
 quintrit-cuda = { path = "../quintrit-cuda", version = "0.2.0", optional = true }
 

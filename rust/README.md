@@ -7,7 +7,7 @@ The code of Quintrit. Overview, documentation and examples are in the [repositor
 |---|---|
 | [`quintrit-core`](crates/quintrit-core/README.md) | Kernels: velurex encoding, activation tables, tiled layouts, SIMD GEMV (AVX2, AVX-512, NEON, portable), threading |
 | [`quintrit-format`](crates/quintrit-format/README.md) | GGUF reader, ternary tensor decoders (`I2_S`, `TQ1_0`, `TQ2_0`), transcoder into the tiled layout |
-| [`quintrit-bitnet`](crates/quintrit-bitnet/README.md) | Rust transcription of the 4-trit BitNet kernels, the baseline for kernel comparisons (Rust only, not published) |
+| [`quintrit-bitnet`](crates/quintrit-bitnet/README.md) | Rust transcription of the 4-trit BitNet kernels, the baseline for kernel comparisons (Rust only) |
 | [`quintrit-runtime`](crates/quintrit-runtime/README.md) | Transformer engine, KV cache, tokenizer, sampling and the `quintrit` command-line tool |
 | [`quintrit-c`](crates/quintrit-c/README.md) | C ABI (`quintrit_c` library, `include/quintrit.h`) and the C++ wrapper `include/quintrit.hpp` |
 | [`quintrit-py`](crates/quintrit-py/README.md) | Python package `quintrit` (PyO3 and maturin) |

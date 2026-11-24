@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest a feature, a platform or a model family
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do?
+      description: The use case first, then the idea. A new instruction set, a model family or a binding is easier to judge with a link to its specification.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried or considered?
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contribution
+      options:
+        - label: I could work on this myself, or test it on my hardware.

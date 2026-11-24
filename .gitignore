@@ -7,3 +7,8 @@ results/
 
 # Model weights downloaded for the benchmarks (see docs/benchmarks.md)
 models/
+
+# Release builds: archives, wheels and the generated third-party license lists (see .github/workflows/release.yml)
+/dist/
+/licenses/
+NOTICE-THIRD-PARTY.md

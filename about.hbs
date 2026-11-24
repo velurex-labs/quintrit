@@ -1,0 +1,28 @@
+# Third-party licenses
+
+Quintrit itself is licensed under the Apache License, Version 2.0 (see `LICENSE` and `NOTICE`). The binaries and
+libraries that are built from it also contain the following third-party Rust crates. Their license texts follow.
+
+## Overview
+
+| License | Crates |
+|---|---|
+{{#each overview}}
+| {{{name}}} | {{count}} |
+{{/each}}
+
+## Licenses
+{{#each licenses}}
+
+### {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- {{{crate.name}}} {{crate.version}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+{{/each}}

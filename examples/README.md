@@ -1,6 +1,9 @@
 # Examples
 
-Small programs that use Quintrit at the kernel level (pack a ternary matrix and multiply it with `int8` activations;
+**Start here if you only want to try it:** [`cli/`](cli/README.md) downloads the prebuilt `quintrit` program and a small model
+and runs one answer, a chat and a benchmark, with no Rust toolchain, compiler or Python.
+
+The programs below use Quintrit at the kernel level (pack a ternary matrix and multiply it with `int8` activations;
 each checks its result against a plain integer product) and at the runtime level (load a GGUF model and generate
 text). The runtime examples need a ternary GGUF model; the kernel examples need nothing.
 

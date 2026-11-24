@@ -4,8 +4,9 @@ A faithful Rust transcription of the 4-trit kernels of [Microsoft BitNet](https:
 (2.00 bits per weight). It exists for one purpose: to compare the quintrit kernels (5 trits per byte, 1.60 bits per
 weight) with the original encoding under the same compiler, the same machine and the same harness.
 
-The crate is for Rust only. It is not part of the C library or the Python package, and it is not published to
-crates.io.
+The crate is for Rust only. It is not part of the C library or the Python package. It is published so that anyone can
+repeat the comparison with the original encoding. It is an independent port; it is not affiliated with or endorsed by
+Microsoft.
 
 ## Kernels
 

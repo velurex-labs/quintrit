@@ -1,0 +1,60 @@
+name: Bug report
+description: Something does not work, or a result is wrong
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. Questions and measurements on your own hardware belong in
+        [Discussions](https://github.com/velurex-labs/quintrit/discussions), not here. A vulnerability must not be
+        reported in public: see [SECURITY.md](https://github.com/velurex-labs/quintrit/blob/main/SECURITY.md).
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Command-line tool (quintrit)
+        - Rust crates
+        - C / C++ library
+        - Python package
+        - GPU backend (CUDA)
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: The smallest example that shows the problem, with the exact command or code.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output or error message
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Quintrit version
+      description: A release version, or the commit of a source build.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and CPU
+      description: 'For example "Ubuntu 24.04, AMD EPYC 9V45" or "Windows 11, Intel Core i7-7700". For a GPU, also the card and the driver version.'
+    validations:
+      required: true
+  - type: input
+    id: toolchain
+    attributes:
+      label: Toolchain
+      description: 'The output of `rustc --version` for a source build, or the Python version for the Python package.'
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: 'The model and file name, if a model is involved. For a wrong numerical result, also the kernel (`quintrit` or `quintrit_512`) and whether the result differs between kernels or CPUs.'

@@ -1,0 +1,249 @@
+name: Release
+
+# Pushing a tag `v<version>` builds the command-line tool and the C library for every platform, the Python wheels and the
+# source distribution, and creates a DRAFT GitHub release with all of them. Nothing is published to PyPI or crates.io
+# here: that is the separate, manually started workflow `publish.yml`. Without a tag (manual start) everything is built
+# and uploaded as workflow artifacts only, as a dry run.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  verify:
+    name: Check the version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Versions agree with each other and with the tag
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            python .github/scripts/check_version.py "${GITHUB_REF_NAME}"
+          else
+            python .github/scripts/check_version.py
+          fi
+
+  # The list of third-party crates and their license texts, shipped inside every archive and wheel.
+  licenses:
+    name: Third-party licenses
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Generate
+        working-directory: rust
+        run: |
+          mkdir -p ../licenses
+          cargo about generate --config ../about.toml --manifest-path crates/quintrit-runtime/Cargo.toml ../about.hbs > ../licenses/THIRD_PARTY_LICENSES.md
+          cargo about generate --config ../about.toml --manifest-path crates/quintrit-py/Cargo.toml ../about.hbs > ../licenses/NOTICE-THIRD-PARTY.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licenses
+          path: licenses/
+          if-no-files-found: error
+
+  # The command-line tool and the C library. No RUSTFLAGS tune the code for a CPU model: the instruction set is chosen
+  # when the program starts. The Windows build links the C runtime statically, so the program runs without the Visual C++
+  # redistributable. The Linux builds use the oldest runner images (glibc 2.35).
+  cli:
+    name: Tool and C library (${{ matrix.platform }})
+    needs: [verify, licenses]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, os: ubuntu-22.04, rustflags: "" }
+          - { platform: linux-aarch64, os: ubuntu-22.04-arm, rustflags: "" }
+          - { platform: windows-x86_64, os: windows-2025, rustflags: "-C target-feature=+crt-static" }
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: actions/download-artifact@v4
+        with:
+          name: licenses
+          path: licenses
+      - name: Build the command-line tool
+        working-directory: rust
+        run: cargo build --release -p quintrit-runtime --bin quintrit
+      - name: Build the C library
+        working-directory: rust
+        run: cargo build --profile release-unwind -p quintrit-c
+      - name: The tool starts
+        run: rust/target/release/quintrit --help
+      - name: Package
+        run: python .github/scripts/package.py --platform "${{ matrix.platform }}" --out dist --licenses licenses/THIRD_PARTY_LICENSES.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tool-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  # The Python wheels. Linux wheels are built in the official manylinux_2_28 images (glibc 2.28 or newer); every wheel is
+  # installed into a clean environment and tested. One abi3 wheel serves CPython 3.9 and newer.
+  wheels:
+    name: Wheel (${{ matrix.platform }})
+    needs: [verify, licenses]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, os: ubuntu-24.04, manylinux: x86_64 }
+          - { platform: linux-aarch64, os: ubuntu-24.04-arm, manylinux: aarch64 }
+          - { platform: windows-x86_64, os: windows-2025, manylinux: "" }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: licenses
+          path: licenses
+      - name: Add the third-party license list to the package
+        run: cp licenses/NOTICE-THIRD-PARTY.md rust/crates/quintrit-py/NOTICE-THIRD-PARTY.md
+      - name: Build in the manylinux_2_28 image
+        if: matrix.manylinux != ''
+        run: |
+          docker run --rm -v "$PWD":/io -w /io/rust/crates/quintrit-py quay.io/pypa/manylinux_2_28_${{ matrix.manylinux }} bash -c '
+            set -e
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+            rustc --version
+            /opt/python/cp312-cp312/bin/pip install maturin
+            /opt/python/cp312-cp312/bin/maturin build --release --compatibility manylinux_2_28 --out /io/dist \
+              -i /opt/python/cp39-cp39/bin/python'
+      - name: Build on Windows
+        if: matrix.manylinux == ''
+        working-directory: rust/crates/quintrit-py
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          python -m pip install maturin
+          maturin build --release --out ../../../dist
+      - name: Install the wheel and run the tests
+        working-directory: rust/crates/quintrit-py
+        run: |
+          python -m pip install numpy pytest ../../../dist/*.whl
+          python -m pytest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # The source distribution, and a proof that it builds on its own (outside the repository, from the archive only).
+  sdist:
+    name: Source distribution
+    needs: [verify, licenses]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: licenses
+          path: licenses
+      - name: Build the archive
+        run: |
+          cp licenses/NOTICE-THIRD-PARTY.md rust/crates/quintrit-py/NOTICE-THIRD-PARTY.md
+          python -m pip install maturin
+          maturin sdist --manifest-path rust/crates/quintrit-py/Cargo.toml --out dist
+      - name: Build and import it in a clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/sdist-venv"
+          "$RUNNER_TEMP/sdist-venv/bin/pip" install dist/*.tar.gz
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/sdist-venv/bin/python" -I -c "import quintrit; print(quintrit.__version__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # A draft release with every file and a checksum list. Only for a tag; the draft is published by hand after a review.
+  release:
+    name: Draft release
+    if: github.ref_type == 'tag'
+    needs: [cli, wheels, sdist]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: "{tool-*,wheel-*,sdist}"
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cat > ../notes.md <<'EOF'
+          ## Downloads
+
+          | File | Contents |
+          |---|---|
+          | `quintrit-<platform>` | The `quintrit` command-line tool. Unpack and run; no Rust toolchain is needed. |
+          | `quintrit-c-<platform>` | The C and C++ library with headers (`include/`) and the shared and static library (`lib/`). |
+          | `quintrit-<version>-*.whl`, `quintrit-<version>.tar.gz` | The Python package (also on PyPI once published). |
+          | `SHA256SUMS.txt` | Checksums of all files: `sha256sum -c SHA256SUMS.txt`. |
+
+          Platforms: Linux x86-64 and AArch64 (the tool and the C library need glibc 2.35 or newer; the wheels glibc 2.28 or
+          newer) and Windows x86-64 (statically linked C runtime). macOS is not part of this release.
+          EOF
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "Quintrit ${GITHUB_REF_NAME#v}" --notes-file notes.md --generate-notes

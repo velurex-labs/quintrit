@@ -2,6 +2,9 @@
 
 Thank you for your interest. Bug reports, questions, documentation fixes and code contributions are welcome.
 
+This project follows the [Code of Conduct](CODE_OF_CONDUCT.md). Report a security problem as described in
+[`SECURITY.md`](SECURITY.md), not in a public issue.
+
 ## License of contributions
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as

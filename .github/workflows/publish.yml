@@ -1,0 +1,108 @@
+name: Publish
+
+# Started by hand, never by a tag. A publication to PyPI or crates.io cannot be undone: a mistake needs a new version.
+# Every target runs in its own GitHub environment (`testpypi`, `pypi`, `crates-io`); give those environments required
+# reviewers so that each upload needs an explicit approval.
+#
+# The Python files come from a finished run of the workflow "Release" (its run id is the input `run_id`), so exactly the
+# files that were tested are uploaded. The Rust crates are built from the checked-out tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+          - crates-io
+        required: true
+      run_id:
+        description: "Run id of the workflow Release that built the Python files (testpypi, pypi)"
+        required: false
+      tag:
+        description: "Release tag to build the crates from, for example v0.2.0 (crates-io)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Upload the Python package (${{ inputs.target }})
+    if: inputs.target == 'testpypi' || inputs.target == 'pypi'
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.target }}
+    permissions:
+      id-token: write # trusted publishing: no token is stored
+      actions: read
+    steps:
+      - name: Download the files of the release run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          test -n "$RUN_ID" || { echo "run_id is required"; exit 1; }
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts --pattern 'wheel-*' --pattern sdist
+          mkdir dist
+          find artifacts -type f \( -name '*.whl' -o -name '*.tar.gz' \) -exec cp {} dist/ \;
+          ls -l dist
+      - name: Upload to TestPyPI
+        if: inputs.target == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+      - name: Upload to PyPI
+        if: inputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  crates:
+    name: Upload the Rust crates
+    if: inputs.target == 'crates-io'
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Dry run of all six crates
+        # Fails before anything is uploaded when a manifest cannot be published, so that the crates are never published
+        # halfway (the later crates depend on the earlier ones).
+        working-directory: rust
+        run: cargo publish --dry-run -p quintrit-core -p quintrit-format -p quintrit-bitnet -p quintrit-cuda -p quintrit-runtime -p quintrit-c
+      - name: Publish in dependency order
+        working-directory: rust
+        env:
+          # A token of the account that owns the crate names, stored as a secret of the environment `crates-io`.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # `cargo publish` waits until the uploaded crate is visible in the index, so the next one can depend on it.
+          cargo publish -p quintrit-core
+          cargo publish -p quintrit-format
+          cargo publish -p quintrit-bitnet
+          cargo publish -p quintrit-cuda
+          cargo publish -p quintrit-runtime
+
+          # crates.io limits how fast new crates can be created (a short burst, then one every few minutes), so the
+          # last of the six may be refused. Wait and try again, at most three times. A crate that is already there
+          # (a re-run of this job) counts as published.
+          set -o pipefail
+          for attempt in 1 2 3; do
+            if cargo publish -p quintrit-c 2>&1 | tee publish.log; then
+              exit 0
+            fi
+            if grep -q "already exists" publish.log; then
+              echo "quintrit-c is already published"
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "Publishing quintrit-c failed (attempt $attempt of 3); waiting 11 minutes."
+            sleep 660
+          done

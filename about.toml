@@ -1,0 +1,32 @@
+# Configuration of `cargo about`, which lists the third-party Rust crates that are linked into the released binaries,
+# the C library and the Python wheels, together with their license texts.
+#
+#   cargo about generate --config about.toml --manifest-path rust/crates/quintrit-runtime/Cargo.toml about.hbs
+#   cargo about generate --config about.toml --manifest-path rust/crates/quintrit-py/Cargo.toml about.hbs
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+]
+
+# Crates that are only used to build or to test are not part of the shipped code.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]

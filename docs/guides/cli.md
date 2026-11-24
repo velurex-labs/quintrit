@@ -3,6 +3,13 @@
 A small program that loads a GGUF model, generates text, chats and measures speed. It
 is the binary `quintrit` of the crate [`quintrit-runtime`](../../rust/crates/quintrit-runtime/README.md).
 
+## Get the program
+
+Download the archive of your platform from the [latest release](https://github.com/velurex-labs/quintrit/releases/latest)
+(Linux x86-64, Linux ARM64, Windows x86-64), unpack it and run `quintrit`; nothing else is needed. A step-by-step
+walkthrough with a small model, one answer, a chat and a benchmark is in
+[`examples/cli/`](../../examples/cli/README.md). To build it yourself, see the next section.
+
 ## Build and run
 
 From [`rust/`](../../rust/) (Rust 1.98 or newer):

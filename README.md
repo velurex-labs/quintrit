@@ -1,121 +1,141 @@
 # Quintrit
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Rust Version](https://img.shields.io/badge/rustc-1.98%2B-orange.svg)](https://blog.rust-lang.org/)
-[![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%7C%20AVX--512%20%7C%20NEON-brightgreen.svg)](#key-features)
-[![Format](https://img.shields.io/badge/encoding-velurex%201.60%20bpw-blueviolet.svg)](docs/velurex-encoding.md)
+[![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%7C%20AVX--512%20%7C%20NEON-brightgreen.svg)](docs/kernels.md)
+[![Encoding](https://img.shields.io/badge/weights-1.60%20bits-blueviolet.svg)](docs/how-it-works.md)
 
-**High-performance, memory-efficient inference for ternary Large Language Models (1.58-bit LLMs).**
+**Run ternary (1.58-bit) language models fast on ordinary CPUs.** One small program for the command line, and libraries
+for Python, C, C++ and Rust. From a Raspberry Pi to a server, no GPU needed.
 
-`LLM Inference` &bull; `Ternary Computing` &bull; `1.58-bit Weights` &bull; `SIMD Kernels` &bull; `GGUF` &bull; `Rust / C++ / Python`
+`LLM Inference` &bull; `Ternary Computing` &bull; `1.58-bit Weights` &bull; `SIMD Kernels` &bull; `GGUF` &bull; `Rust / C++ / Python / CUDA`
 
----
+## Try it
 
-Quintrit implements **"velurex encoding"**, packing five ternary weights into a single byte (**1.60 bits per weight**) to achieve a **20% memory bandwidth reduction** compared to conventional 2-bit formats. Coupled with division-free SIMD decoding and exact Look-Up Table (LUT) kernels for AVX2, AVX-512, and ARM NEON, Quintrit delivers higher inference throughput while directly reading standard GGUF models.
+No Rust, no compiler, no Python: download the program and a small model, and ask a question.
 
----
+```bash
+# Linux x86-64 (ARM64 and Windows: see examples/cli)
+curl -L https://github.com/velurex-labs/quintrit/releases/latest/download/quintrit-linux-x86_64.tar.gz | tar xz
+curl -L -o model.gguf https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/main/Ternary-Bonsai-1.7B-Q2_0.gguf
 
-## Ternary Computing & 5 Trits per Byte
+./quintrit-linux-x86_64/quintrit --model model.gguf --prompt "What is ternary computing?" --chat-template --max-tokens 100
+```
 
-### The Memory Wall of 1.58-bit LLMs
-In 1.58-bit Large Language Models (such as BitNet b1.58 and Falcon3), neural network weights are restricted to ternary values: $w \in \{-1, 0, +1\}$. During autoregressive token generation, multiplying an activation vector by a weight projection matrix (GEMV) simplifies from expensive floating-point multiplications into pure additions and subtractions:
+The same program also chats (`--chat`) and measures the speed of your machine (`--bench`). The step-by-step walkthrough
+for Linux, ARM and Windows is in [`examples/cli/`](examples/cli/README.md).
 
-$$y_j = \sum_{i} w_{ji} \cdot x_i \quad \text{where} \quad w_{ji} \in \{-1, 0, +1\}$$
+## Why Quintrit
 
-Because arithmetic computation is minimized, autoregressive token generation on modern CPUs is fundamentally bottlenecked by **memory bandwidth**: every weight parameter across all transformer layers must be streamed from RAM to CPU registers once per generated token.
+- **Built for ordinary CPUs.** Quintrit targets conventional desktop, server and edge CPUs, where generating a token is
+  limited by how fast memory delivers the weights, not by arithmetic: the cores keep up with the data. So the layout
+  matters. Weights take 1.60 bits each instead of 2.00, which means up to 20 % less memory traffic per token. (On a
+  single slow core the arithmetic can become the limit; the [benchmarks](docs/benchmarks.md) show where.) Kernels for
+  AVX2, AVX-512 and ARM NEON are chosen when the program starts. [How it works](docs/how-it-works.md)
+- **Reads the models you already have.** Standard GGUF files (`I2_S`, `TQ1_0`, `TQ2_0`, `Q2_0`) are loaded directly:
+  BitNet b1.58, Falcon3 and Falcon-E, Llama 3 1.58, Qwen3-based Ternary Bonsai and Nemotron-H.
+- **Exact.** The results are identical on AVX2, AVX-512, NEON and the GPU, and match the reference implementations
+  token for token. A faster kernel never trades away correctness.
+- **Easy to embed.** One engine with a command-line tool, a Python package, a C library with a C++ wrapper, and Rust
+  crates. An optional NVIDIA GPU backend gives the same results.
 
-### The Storage Gap: 2.00 bpw vs. 1.60 bpw
-The theoretical information content of a ternary state is $\log_2(3) \approx 1.585$ bits. However, conventional 2-bit formats (such as Microsoft's `I2_S`) pack only 4 trits into an 8-bit byte ($2.00$ bits per weight). This leaves nearly 70% of available byte states unused ($3^4 = 81$ states out of $2^8 = 256$).
+## Use it in your code
 
-Quintrit bridges this gap with **velurex encoding**, packing **5 trits per byte**:
+Python (`pip install quintrit`):
 
-$$3^5 = 243 \le 256$$
+```python
+import quintrit
 
-- **1.60 bits per weight:** Utilizes 99.1% of theoretical byte capacity.
-- **20% less memory traffic:** Reduces weight data transfer from 250 MB down to 200 MB per billion weights per token.
-- **25% higher theoretical throughput ceiling:** Because memory bandwidth dictates decoding speed, streaming 20% less data allows up to 25% higher token generation rates under memory-bound conditions.
+model = quintrit.Model.load("model.gguf")
+print(model.chat([{"role": "user", "content": "What is ternary computing?"}], max_tokens=64))
+```
 
-### Division-Free SIMD Decoding
-Packing five ternary weights into a byte is traditionally done using standard base-3 powers $(1, 3, 9, 27, 81)$. Read as a plain integer, such a byte needs integer division and modulo arithmetic to separate the digits, and SIMD vector lanes have neither. llama.cpp's `TQ1_0` therefore stores the byte as a base-3 fixed-point fraction and extracts every weight on its own, with a byte multiplication by a power of 3, a multiplication by 3 and a shift.
+C++ (header `quintrit.hpp` and the library from the `quintrit-c-<platform>` archive of a release):
 
-Velurex encoding departs from the traditional $(1, 3, 9, 27, 81)$ scheme. By employing an algebraic radix structure specifically engineered for vector hardware, it eliminates integer division and remainder operations and splits each byte at once into two digit groups (two and three weights). Weights decode across vector lanes using only fast bitwise shifts, byte averages (`vpavgb`, `vrhadd`), or vector shuffles (`vpermb`), and the two groups index directly into fused Look-Up Table (LUT) kernels that evaluate integer dot products against `int8` activations with zero rounding error.
+```cpp
+#include <iostream>
+#include "quintrit.hpp"
 
-The complete mathematical definition and derivation are documented in [`docs/velurex-encoding.md`](docs/velurex-encoding.md).
+int main() {
+    quintrit::Model model("model.gguf");
+    quintrit::Session session = model.create_session();
+    quintrit::GenerateOptions options;
+    options.max_tokens = 64;
+    session.generate(model.format_chat({{"user", "What is ternary computing?"}}), options,
+                     [](const char* text, std::size_t len) { std::cout.write(text, len); return true; });
+}
+```
 
----
+Rust (crate `quintrit-runtime`):
 
-## Key Features
+```rust
+use quintrit_runtime::{InferenceEngine, SamplingConfig, TernaryKernelType};
 
-- **Exact Integer Arithmetic:** Operates on the full activation range using a fused $x = 16 \cdot \text{hi} + \text{lo}$ split. Yields identical, bit-exact results across AVX2, AVX-512, and ARM NEON.
-- **Native GGUF Compatibility:** Directly loads standard GGUF models containing `I2_S`, `TQ1_0`, `TQ2_0` or `Q2_0` tensors and transcodes them in memory into velurex-encoded SIMD layouts (`Q2_0`, which has a scale per 64 weights, keeps its scales next to the trits). Supported architectures: BitNet b1.58, LLaMA and Falcon3 (including Falcon-E), Qwen3, Qwen3.5 and Nemotron-H MoE. This guarantees instant, zero-conversion compatibility with existing models from the `llama.cpp` and BitNet ecosystems without requiring separate weight distribution.
-- **NVIDIA GPUs (optional):** The same encoding runs on GPUs of compute capability 8.0 or newer with results bit-identical to the CPU path, from Rust, C, C++ and Python ([`docs/guides/gpu.md`](docs/guides/gpu.md)).
-- **Multi-Platform SIMD:** Hand-optimized kernels for x86-64 (AVX2, AVX-512 with VBMI/VNNI) and AArch64 (ARM NEON with DotProd and I8MM).
-- **Unified C / C++ / Python / Rust API:** Rust workspace (`quintrit-core`, `quintrit-format`, `quintrit-runtime`), C ABI (`libquintrit`), and Python bindings (`quintrit`).
+let mut engine = InferenceEngine::load_from_gguf("model.gguf", 4, Some(TernaryKernelType::QuintritLut))?;
+engine.generate_streaming("Ternary computing is", 64, &SamplingConfig::greedy(), |piece| print!("{piece}"))?;
+```
 
----
+Guides: [Python](docs/guides/python.md), [C and C++](docs/guides/c-cpp.md), [Rust](docs/guides/rust.md),
+[command line](docs/guides/cli.md). Runnable programs are in [`examples/`](examples/README.md).
 
-## Benchmarks
+## What runs, and how fast
 
-The quintrit kernels are compared with faithful Rust transcriptions of Microsoft BitNet's kernels (`mad` on AVX2 and NEON, its AVX-512 widening `mad512`) in the same harness, on the same machines, over the weight-streaming pattern of one Falcon3-10B decode step. Before every measurement, the runtime's 256 greedy tokens and checked logits were bit-identical to the BitNet reference runtime.
+Generated tokens per second on the CPU (median of 5 runs, 256 greedy tokens, all hardware threads), measured with the
+`--bench` command above:
 
-### Excerpt: GEMV kernel throughput (Falcon3-10B shapes, weights from DRAM)
+| Model | Core i7-7700<br>AVX2 | EPYC 9V45<br>AVX-512 | Raspberry Pi 5<br>NEON |
+|---|---:|---:|---:|
+| [Falcon-E 1B](model_benchmarks/falcon-e-1b-instruct.md) | 46.3 | 78.9 | 20.6 |
+| [BitNet b1.58 2B4T](model_benchmarks/bitnet-b1.58-2b-4t.md) | 22.6 | 37.8 | 9.6 |
+| [Falcon3 1.58bit 10B](model_benchmarks/falcon3-10b-instruct-1.58bit.md) | 9.0 | 14.6 | 3.6 |
 
-| Machine | Instruction set | Threads | BitNet kernel | Quintrit kernel | Relative speed |
-|---|---|---:|---:|---:|---:|
-| AMD EPYC 9V45 | AVX-512 (vs. `mad512`) | 4 | 164.2 Gweights/s | **221.6 Gweights/s** | **1.35×** |
-| Intel Core i7-7700 | AVX2 | 4 | 97.9 Gweights/s | **146.9 Gweights/s** | **1.50×** |
-| Raspberry Pi 5 | NEON | 4 | 40.7 Gweights/s | **55.1 Gweights/s** | **1.35×** |
-| Raspberry Pi 5 | NEON | 1 | 24.5 Gweights/s | 17.3 Gweights/s | 0.71× |
+Seventeen models on four CPUs and two NVIDIA GPUs, with the thread scaling and the measurement conditions of each
+number, are in [`model_benchmarks/`](model_benchmarks/README.md).
 
-The 5-trit kernels win where the BitNet kernel is close to the memory ceiling of the machine and lose where one core is compute-bound. These are kernel rates; a whole token also runs the F16 output projection and attention, which are the same for both encodings, so the gain per token is smaller. The full table, the method and the memory ceilings are in [`docs/benchmarks.md`](docs/benchmarks.md).
+| Platform | Program and C library | Python package |
+|---|---|---|
+| Linux x86-64 (AVX2, AVX-512) | yes | yes |
+| Linux ARM64 (NEON; tested on Raspberry Pi 5 and Neoverse-N2) | yes | yes |
+| Windows x86-64 | yes | yes |
+| macOS (Apple silicon, Intel) | build from source; not tested yet | not tested yet |
+| NVIDIA GPU (compute capability 8.0 or newer) | build from source with the CUDA toolkit ([guide](docs/guides/gpu.md)) | build from source |
 
-The decode speed of whole models is reported in [`model_benchmarks/`](model_benchmarks/README.md): 17 ternary language models on four CPUs and two NVIDIA GPUs, with one page per model that holds the thread scaling, the long-prompt figures, the measurement conditions and the command to reproduce the numbers.
+Good to know:
 
----
+- Quintrit runs ternary models. It does not run ordinary 4-bit or 8-bit models.
+- A prompt is processed one token at a time (there is no batched prompt processing yet), so a very long prompt takes a
+  while before the first word appears.
+- Models are not part of this repository; take them from their publishers and read their terms.
 
 ## Documentation
 
-Full documentation and guides are available in [`docs/`](docs/):
-
-| Document | Description |
+| Document | Content |
 |---|---|
-| [`docs/velurex-encoding.md`](docs/velurex-encoding.md) | Mathematical definition, radix structure, and division-free SIMD decoding |
-| [`docs/simd-decode.md`](docs/simd-decode.md) | Per-ISA weight decode (AVX2, AVX-512, NEON): instruction sequences and bit tricks |
-| [`docs/architecture.md`](docs/architecture.md) | System architecture, crate layout, tile formats, and memory pipeline |
-| [`docs/kernels.md`](docs/kernels.md) | Kernel implementations, exact arithmetic, and supported instruction sets |
-| [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmarking methodology, memory ceiling analysis, and hardware reports |
-| [`model_benchmarks/`](model_benchmarks/README.md) | Decode speed of 17 ternary models on four CPUs and two NVIDIA GPUs, one page per model |
-| [`docs/guides/`](docs/guides/) | Guides for Rust, C/C++, Python, the CLI and running on an NVIDIA GPU |
+| [`docs/how-it-works.md`](docs/how-it-works.md) | Why ternary models are limited by memory, and how five weights fit into one byte |
+| [`docs/guides/`](docs/guides/) | Guides for the command-line tool, Python, C and C++, Rust, and the GPU |
+| [`examples/`](examples/README.md) | Runnable programs, starting with the one that needs no installation |
+| [`model_benchmarks/`](model_benchmarks/README.md) | Decode speed of 17 models on four CPUs and two GPUs |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Kernel comparisons, memory ceilings and how to reproduce the measurements |
+| [`docs/velurex-encoding.md`](docs/velurex-encoding.md) | The exact definition of the encoding |
+| [`docs/architecture.md`](docs/architecture.md), [`docs/kernels.md`](docs/kernels.md), [`docs/simd-decode.md`](docs/simd-decode.md) | Crates, kernels and the instruction sequences |
 
-### Building & Testing
-
-The Rust workspace is located in [`rust/`](rust/). To compile and execute tests without needing models or network access:
-
-```bash
-cd rust
-cargo test --workspace
-```
-
-The kernel tests compare every SIMD kernel bit for bit with a brute-force product written in plain scalar code on standard CPU operations, without SIMD or any of the library's packing and lookup tables.
-
----
+To build from source (Rust 1.98 or newer): `cd rust && cargo test --workspace` runs the tests, which need no model and no
+network, and `cargo build --release -p quintrit-runtime --bin quintrit` builds the program.
 
 ## Roadmap
 
-Planned milestones and future developments:
+Planned, in no particular order:
 
-- **Official Distribution:** Publish packages on [crates.io](https://crates.io) and [PyPI](https://pypi.org) with pre-built binary wheels for Linux, Windows, and macOS.
-- **Pre-Tiled Native Format & Direct `mmap`:** Introduce a dedicated file format / GGUF tensor type extension with pre-tiled velurex weights, enabling direct zero-copy memory mapping (`mmap`) straight from disk without startup transcoding or RAM allocation.
-- **Hardware Acceleration:** Further GPU backends, and faster kernels for the block-scaled `Q2_0` models on the NVIDIA GPU (they are bit-exact, but their projection kernels have not been tuned yet).
-- **RISC-V Support:** Native kernels for RISC-V processors implementing the RVA23 profile, built on the mandatory RISC-V Vector Extension (RVV 1.0).
-- **Extended Benchmarks:** Per-model benchmarks on additional CPU microarchitectures, including Apple processors (Apple Silicon M-series), alongside dedicated performance benchmarks for long context sequences.
-- **Edge Efficiency:** Telemetry-backed energy consumption profiling (Joules per decoded token) across edge platforms.
-- **Hardware-Level Implementation (FPGA & ASIC):** Explore dedicated digital architecture and hardware-level implementation possibilities (FPGA prototyping and ASIC designs) leveraging division-free velurex decoding for custom ternary accelerator cores.
-
----
+- macOS and Apple silicon: tests, wheels, program archives and benchmarks.
+- A pre-tiled weight format with direct memory mapping, so that a model loads without conversion.
+- RISC-V kernels for processors with the vector extension (RVV 1.0).
+- Faster kernels for the block-scaled `Q2_0` models on the NVIDIA GPU, and further GPU backends.
+- Energy per generated token on edge devices.
+- Hardware-level implementations (FPGA prototypes, ASIC designs) that use the division-free decoding.
 
 ## Contributing, Citation & License
 
 - **Contributing:** Guidelines for reporting issues, contributing code, and running tests are in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- **Conduct and security:** Participation follows the [`Code of Conduct`](CODE_OF_CONDUCT.md); report a vulnerability as described in [`SECURITY.md`](SECURITY.md), not in a public issue.
 - **License:** Quintrit is licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) for details.
 - **Citation:** If you use Quintrit or the velurex encoding in your research or project, please cite it using the metadata in [`CITATION.cff`](CITATION.cff).
+- **Maintainer and contact:** Quintrit is developed by Velurex Labs. Contact: <quintrit@velurex-labs.com>.

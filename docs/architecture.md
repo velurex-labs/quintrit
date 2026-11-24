@@ -7,7 +7,7 @@ rust/
 ├── crates/
 │   ├── quintrit-core      kernels: velurex encoding, activation tables, tiled layouts, SIMD GEMV, threading
 │   ├── quintrit-format    GGUF reader, ternary tensor decoders, transcoder into the tiled layout
-│   ├── quintrit-bitnet    Rust transcription of the 4-trit BitNet kernels, the comparison baseline (Rust only, not published)
+│   ├── quintrit-bitnet    Rust transcription of the 4-trit BitNet kernels, the comparison baseline (Rust only)
 │   ├── quintrit-runtime   transformer engine, KV cache, tokenizer, sampling, the `quintrit` command-line tool
 │   ├── quintrit-cuda      optional NVIDIA GPU backend: CUDA kernels, driver layer, device profiles (not in the default build)
 │   ├── quintrit-c         C ABI (`quintrit_c` library, `quintrit.h`) and the header-only C++ wrapper `quintrit.hpp`

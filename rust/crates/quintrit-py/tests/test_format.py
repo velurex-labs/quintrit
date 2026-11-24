@@ -188,10 +188,11 @@ def test_tensor_data_outside_the_file(tmp_path):
 
 
 def test_unreadable_tensor_type(tmp_path):
-    path = write_gguf(tmp_path / "q8.gguf", {"general.architecture": "llama"}, [("w", [32, 2], 8, bytes(68))])
+    # Type 2 is `Q4_0`, a layout the reader does not know (`Q8_0` became readable with the block-scaled models).
+    path = write_gguf(tmp_path / "q4.gguf", {"general.architecture": "llama"}, [("w", [32, 2], 2, bytes(36))])
     with quintrit.GgufFile(path) as f:
         info = f.tensor("w")
-        assert info.dtype == "Q8_0" and info.nbytes is None
+        assert info.dtype == "UNKNOWN(2)" and info.nbytes is None
         with pytest.raises(quintrit.FormatError):
             f.read_raw("w")
         with pytest.raises(quintrit.FormatError, match="cannot decode"):
