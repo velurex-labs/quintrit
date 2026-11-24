@@ -69,3 +69,11 @@ Compare GPU results with the CPU path, not with a tolerance: a kernel change mus
   which hardware it was tested on. Please do not claim a speed-up without a measurement and the CPU it was taken on.
 - Write comments, documentation and commit messages in English, and follow the style of the surrounding code.
 - Make sure `cargo test` passes before you submit.
+
+### What happens to an accepted pull request
+
+This repository is published as one snapshot commit per release; the maintainers develop in a separate source tree. A pull
+request is reviewed here as usual, with comments and requested changes. When it is accepted, the maintainers apply the change
+to their source tree and it is published with the next release snapshot, and the author is named in the release notes. Your
+pull request is then closed with a note that points to the snapshot, so GitHub shows it as closed, not as merged. This is
+how every change reaches the repository, including those of the maintainers.

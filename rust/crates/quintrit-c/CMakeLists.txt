@@ -97,13 +97,14 @@ add_dependencies(quintrit quintrit_cargo)
 add_library(quintrit::quintrit ALIAS quintrit)
 
 # The static library carries the Rust standard library; the system libraries below are what it needs
-# (`rustc --print native-static-libs` prints the authoritative list for your target).
+# (`rustc --print native-static-libs` prints the list for your target; on Windows it can omit `synchronization`, which the
+# standard library's mutex needs for `WaitOnAddress` with some Windows SDK versions).
 add_library(quintrit_static STATIC IMPORTED GLOBAL)
 set_target_properties(quintrit_static PROPERTIES
   IMPORTED_LOCATION "${_static}"
   INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/include")
 if(WIN32)
-  set_property(TARGET quintrit_static PROPERTY INTERFACE_LINK_LIBRARIES kernel32 ntdll userenv ws2_32 dbghelp)
+  set_property(TARGET quintrit_static PROPERTY INTERFACE_LINK_LIBRARIES kernel32 ntdll userenv ws2_32 dbghelp synchronization)
 elseif(APPLE)
   set_property(TARGET quintrit_static PROPERTY INTERFACE_LINK_LIBRARIES System c m)
 else()

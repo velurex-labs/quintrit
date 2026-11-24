@@ -51,7 +51,7 @@ target_link_libraries(my_app PRIVATE quintrit::quintrit)          # shared
 # target_link_libraries(my_app PRIVATE quintrit::quintrit_static) # static
 ```
 
-Linking by hand: add `include/` to the include path and link `quintrit_c.dll.lib` (Windows), `-lquintrit_c` (Unix); the DLL/shared object must be found at run time. The static library contains the Rust standard library; `rustc --print native-static-libs` lists the system libraries it needs on your target (on Windows MSVC: `kernel32 ntdll userenv ws2_32 dbghelp`, with the dynamic CRT `/MD`).
+Linking by hand: add `include/` to the include path and link `quintrit_c.dll.lib` (Windows), `-lquintrit_c` (Unix); the DLL/shared object must be found at run time. The static library contains the Rust standard library; `rustc --print native-static-libs` lists the system libraries it needs on your target (on Windows MSVC: `kernel32 ntdll userenv ws2_32 dbghelp synchronization`, with the dynamic CRT `/MD`; some Windows SDK versions need `synchronization` although `rustc` does not list it).
 
 ## Conventions
 

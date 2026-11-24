@@ -1,7 +1,14 @@
 version: 2
 updates:
-  # Keeps the versions of the actions used by the workflows current.
+  # Keeps the versions of the actions used by the workflows current: one grouped pull request a month at most.
+  # The pull request is a proposal. The maintainers apply the new versions in their own source tree, and they arrive
+  # with the next release snapshot; the pull request is then closed with a note.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "monthly"
+    open-pull-requests-limit: 1
+    groups:
+      github-actions:
+        patterns:
+          - "*"
