@@ -22,8 +22,8 @@ jobs:
     name: Check the version
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Versions agree with each other and with the tag
@@ -39,7 +39,7 @@ jobs:
     name: Third-party licenses
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
@@ -53,7 +53,7 @@ jobs:
           mkdir -p ../licenses
           cargo about generate --config ../about.toml --manifest-path crates/quintrit-runtime/Cargo.toml ../about.hbs > ../licenses/THIRD_PARTY_LICENSES.md
           cargo about generate --config ../about.toml --manifest-path crates/quintrit-py/Cargo.toml ../about.hbs > ../licenses/NOTICE-THIRD-PARTY.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: licenses
           path: licenses/
@@ -80,8 +80,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Rust
@@ -92,7 +92,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: licenses
           path: licenses
@@ -106,7 +106,7 @@ jobs:
         run: rust/target/release/quintrit --help
       - name: Package
         run: python .github/scripts/package.py --platform "${{ matrix.platform }}" --out dist --licenses licenses/THIRD_PARTY_LICENSES.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tool-${{ matrix.platform }}
           path: dist/
@@ -130,11 +130,11 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: licenses
           path: licenses
@@ -166,7 +166,7 @@ jobs:
         run: |
           python -m pip install numpy pytest ../../../dist/*.whl
           python -m pytest
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.platform }}
           path: dist/*.whl
@@ -179,15 +179,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: licenses
           path: licenses
@@ -202,7 +202,7 @@ jobs:
           "$RUNNER_TEMP/sdist-venv/bin/pip" install dist/*.tar.gz
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/sdist-venv/bin/python" -I -c "import quintrit; print(quintrit.__version__)"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -217,7 +217,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: "{tool-*,wheel-*,sdist}"
