@@ -172,7 +172,7 @@ jobs:
         run: cargo build --release -p quintrit-runtime --bin quintrit
       - name: Restore the model
         id: model-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: models
           key: model-${{ env.MODEL_SHA256 }}
