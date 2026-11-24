@@ -10,6 +10,8 @@ use core::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 
+use crate::dispatch::multiversion;
+
 // ============================================================================
 // RMSNorm (Root Mean Square Layer Normalization)
 // ============================================================================
@@ -233,37 +235,39 @@ pub fn quantize_activations_int8(x: &[f32], out_int8: &mut [i8]) -> f32 {
     quantize_activations_int8_with_range(x, out_int8, 127.0)
 }
 
-/// Same as [`quantize_activations_int8`] with a configurable largest code `levels`
-/// (the scale is `levels / amax` and codes are clamped to `[-(levels + 1), levels]`).
-///
-/// `levels = 127` is the full int8 range that the Quintrit kernels use (they are exact at this range).
-/// A smaller range is only needed by table kernels whose entries pre-sum several products into int8.
-pub fn quantize_activations_int8_with_range(x: &[f32], out_int8: &mut [i8], levels: f32) -> f32 {
-    assert_eq!(x.len(), out_int8.len());
-    let n = x.len();
+multiversion! {
+    /// Same as [`quantize_activations_int8`] with a configurable largest code `levels`
+    /// (the scale is `levels / amax` and codes are clamped to `[-(levels + 1), levels]`).
+    ///
+    /// `levels = 127` is the full int8 range that the Quintrit kernels use (they are exact at this range).
+    /// A smaller range is only needed by table kernels whose entries pre-sum several products into int8.
+    pub fn quantize_activations_int8_with_range(x: &[f32], out_int8: &mut [i8], levels: f32) -> f32 {
+        assert_eq!(x.len(), out_int8.len());
+        let n = x.len();
 
-    let mut max_abs: f32 = 0.0;
-    for &val in x {
-        let abs_val = val.abs();
-        if abs_val > max_abs {
-            max_abs = abs_val;
+        let mut max_abs: f32 = 0.0;
+        for &val in x {
+            let abs_val = val.abs();
+            if abs_val > max_abs {
+                max_abs = abs_val;
+            }
         }
+
+        if !(max_abs > 0.0) {
+            out_int8.fill(0);
+            return 0.0;
+        }
+
+        let s = levels / max_abs;
+        let lo = -(levels + 1.0);
+
+        for i in 0..n {
+            let q = (x[i] * s).round();
+            out_int8[i] = q.clamp(lo, levels) as i8;
+        }
+
+        s
     }
-
-    if !(max_abs > 0.0) {
-        out_int8.fill(0);
-        return 0.0;
-    }
-
-    let s = levels / max_abs;
-    let lo = -(levels + 1.0);
-
-    for i in 0..n {
-        let q = (x[i] * s).round();
-        out_int8[i] = q.clamp(lo, levels) as i8;
-    }
-
-    s
 }
 
 // ============================================================================
@@ -297,13 +301,15 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
-/// Evaluates Squared ReLU activation: $y_i = (\max(0, x_i))^2$.
-pub fn relu2(x: &[f32], out: &mut [f32]) {
-    assert_eq!(x.len(), out.len());
-    for i in 0..x.len() {
-        let v = x[i];
-        let pos = if v > 0.0 { v } else { 0.0 };
-        out[i] = pos * pos;
+multiversion! {
+    /// Evaluates Squared ReLU activation: $y_i = (\max(0, x_i))^2$.
+    pub fn relu2(x: &[f32], out: &mut [f32]) {
+        assert_eq!(x.len(), out.len());
+        for i in 0..x.len() {
+            let v = x[i];
+            let pos = if v > 0.0 { v } else { 0.0 };
+            out[i] = pos * pos;
+        }
     }
 }
 
@@ -394,21 +400,9 @@ pub fn silu(x: &[f32], out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe {
-                let mut i = 0;
-                while i + 8 <= n {
-                    let vx = _mm256_loadu_ps(x.as_ptr().add(i));
-                    let vy = ggml_v_silu_avx2(vx);
-                    _mm256_storeu_ps(out.as_mut_ptr().add(i), vy);
-                    i += 8;
-                }
-                while i < n {
-                    let v = x[i];
-                    out[i] = v / (1.0 + (-v).exp());
-                    i += 1;
-                }
-                return;
-            }
+            // SAFETY: AVX2 and FMA are available; the lengths are equal.
+            unsafe { silu_avx2(x, out) };
+            return;
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -423,6 +417,25 @@ pub fn silu(x: &[f32], out: &mut [f32]) {
     }
 }
 
+/// AVX2 [`silu`]. The `target_feature` attribute makes the intrinsics inline in this body (see [`crate::dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn silu_avx2(x: &[f32], out: &mut [f32]) {
+    let n = x.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let vx = _mm256_loadu_ps(x.as_ptr().add(i));
+        let vy = ggml_v_silu_avx2(vx);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), vy);
+        i += 8;
+    }
+    while i < n {
+        let v = x[i];
+        out[i] = v / (1.0 + (-v).exp());
+        i += 1;
+    }
+}
+
 /// Evaluates SwiGLU gated activation: $out_i = \text{SiLU}(gate_i) \times up_i$ matching ggml_vec_swiglu_f32.
 pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     assert_eq!(gate.len(), up.len());
@@ -432,23 +445,9 @@ pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe {
-                let mut i = 0;
-                while i + 8 <= n {
-                    let vg = _mm256_loadu_ps(gate.as_ptr().add(i));
-                    let vu = _mm256_loadu_ps(up.as_ptr().add(i));
-                    let silu_g = ggml_v_silu_avx2(vg);
-                    let res = _mm256_mul_ps(silu_g, vu);
-                    _mm256_storeu_ps(out.as_mut_ptr().add(i), res);
-                    i += 8;
-                }
-                while i < n {
-                    let v = gate[i];
-                    out[i] = (v / (1.0 + (-v).exp())) * up[i];
-                    i += 1;
-                }
-                return;
-            }
+            // SAFETY: AVX2 and FMA are available; the lengths are equal.
+            unsafe { swiglu_avx2(gate, up, out) };
+            return;
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -463,20 +462,45 @@ pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
-/// Elementwise vector multiplication: $out_i = a_i \times b_i$.
-pub fn elementwise_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
-    assert_eq!(a.len(), b.len());
-    assert_eq!(a.len(), out.len());
-    for i in 0..a.len() {
-        out[i] = a[i] * b[i];
+/// AVX2 [`swiglu`]. The `target_feature` attribute makes the intrinsics inline in this body (see [`crate::dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn swiglu_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    let n = gate.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let vg = _mm256_loadu_ps(gate.as_ptr().add(i));
+        let vu = _mm256_loadu_ps(up.as_ptr().add(i));
+        let silu_g = ggml_v_silu_avx2(vg);
+        let res = _mm256_mul_ps(silu_g, vu);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), res);
+        i += 8;
+    }
+    while i < n {
+        let v = gate[i];
+        out[i] = (v / (1.0 + (-v).exp())) * up[i];
+        i += 1;
     }
 }
 
-/// Adds residual stream vector in-place: $x_i \mathrel{+}= r_i$.
-pub fn add_residual(x: &mut [f32], residual: &[f32]) {
-    assert_eq!(x.len(), residual.len());
-    for i in 0..x.len() {
-        x[i] += residual[i];
+multiversion! {
+    /// Elementwise vector multiplication: $out_i = a_i \times b_i$.
+    pub fn elementwise_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.len(), out.len());
+        for i in 0..a.len() {
+            out[i] = a[i] * b[i];
+        }
+    }
+}
+
+multiversion! {
+    /// Adds residual stream vector in-place: $x_i \mathrel{+}= r_i$.
+    pub fn add_residual(x: &mut [f32], residual: &[f32]) {
+        assert_eq!(x.len(), residual.len());
+        for i in 0..x.len() {
+            x[i] += residual[i];
+        }
     }
 }
 
@@ -561,37 +585,40 @@ pub fn ggml_vec_dot_f16_f32(x: &[u16], y: &[f32]) -> f32 {
     ggml_vec_dot_f16_f32_scalar(x, y)
 }
 
-/// The definition of [`ggml_vec_dot_f16_f32`] (portable code, the same order of operations).
-pub fn ggml_vec_dot_f16_f32_scalar(x: &[u16], y: &[f32]) -> f32 {
-    assert_eq!(x.len(), y.len());
-    let n = x.len();
-    let mut acc = [[0.0f32; 8]; 4];
-    let mut i = 0;
-    while i + 32 <= n {
-        for (j, a) in acc.iter_mut().enumerate() {
-            for (l, lane) in a.iter_mut().enumerate() {
-                let k = i + 8 * j + l;
-                *lane = f16_to_f32(x[k]).mul_add(y[k], *lane);
+multiversion! {
+    /// The definition of [`ggml_vec_dot_f16_f32`] (portable code, the same order of operations). On x86-64 it runs
+    /// with fused multiply-adds and the hardware conversion when the CPU has them (same bits, module `dispatch`).
+    pub fn ggml_vec_dot_f16_f32_scalar(x: &[u16], y: &[f32]) -> f32 {
+        assert_eq!(x.len(), y.len());
+        let n = x.len();
+        let mut acc = [[0.0f32; 8]; 4];
+        let mut i = 0;
+        while i + 32 <= n {
+            for (j, a) in acc.iter_mut().enumerate() {
+                for (l, lane) in a.iter_mut().enumerate() {
+                    let k = i + 8 * j + l;
+                    *lane = H::to_f32(x[k]).mul_add(y[k], *lane);
+                }
             }
+            i += 32;
         }
-        i += 32;
-    }
-    while i + 8 <= n {
-        for (l, lane) in acc[0].iter_mut().enumerate() {
-            *lane = f16_to_f32(x[i + l]).mul_add(y[i + l], *lane);
+        while i + 8 <= n {
+            for (l, lane) in acc[0].iter_mut().enumerate() {
+                *lane = H::to_f32(x[i + l]).mul_add(y[i + l], *lane);
+            }
+            i += 8;
         }
-        i += 8;
+        let mut a = [0.0f32; 8];
+        for l in 0..8 {
+            a[l] = (acc[0][l] + acc[1][l]) + (acc[2][l] + acc[3][l]);
+        }
+        let r = [a[0] + a[4], a[1] + a[5], a[2] + a[6], a[3] + a[7]];
+        let mut sum = ((r[0] + r[2]) + (r[1] + r[3])) as f64;
+        for k in i..n {
+            sum += (H::to_f32(x[k]) * y[k]) as f64;
+        }
+        sum as f32
     }
-    let mut a = [0.0f32; 8];
-    for l in 0..8 {
-        a[l] = (acc[0][l] + acc[1][l]) + (acc[2][l] + acc[3][l]);
-    }
-    let r = [a[0] + a[4], a[1] + a[5], a[2] + a[6], a[3] + a[7]];
-    let mut sum = ((r[0] + r[2]) + (r[1] + r[3])) as f64;
-    for k in i..n {
-        sum += (f16_to_f32(x[k]) * y[k]) as f64;
-    }
-    sum as f32
 }
 
 /// `((l0+l4) + (l1+l5)) + ((l2+l6) + (l3+l7))`: ggml's `GGML_F32x8_REDUCE` tail (`_mm_hadd_ps` twice).
@@ -622,29 +649,32 @@ pub fn ggml_vec_dot_f32(x: &[f32], y: &[f32]) -> f32 {
     ggml_vec_dot_f32_scalar(x, y)
 }
 
-/// The definition of [`ggml_vec_dot_f32`] (portable code, the same order of operations).
-pub fn ggml_vec_dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
-    assert_eq!(x.len(), y.len());
-    let n = x.len();
-    let np = n & !31;
-    let mut acc = [[0.0f32; 8]; 4];
-    for i in (0..np).step_by(32) {
-        for (j, a) in acc.iter_mut().enumerate() {
-            for (l, lane) in a.iter_mut().enumerate() {
-                let k = i + 8 * j + l;
-                *lane = x[k].mul_add(y[k], *lane);
+multiversion! {
+    /// The definition of [`ggml_vec_dot_f32`] (portable code, the same order of operations). On x86-64 it runs with
+    /// fused multiply-adds when the CPU has them (same bits, module `dispatch`).
+    pub fn ggml_vec_dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
+        assert_eq!(x.len(), y.len());
+        let n = x.len();
+        let np = n & !31;
+        let mut acc = [[0.0f32; 8]; 4];
+        for i in (0..np).step_by(32) {
+            for (j, a) in acc.iter_mut().enumerate() {
+                for (l, lane) in a.iter_mut().enumerate() {
+                    let k = i + 8 * j + l;
+                    *lane = x[k].mul_add(y[k], *lane);
+                }
             }
         }
+        let mut a = [0.0f32; 8];
+        for l in 0..8 {
+            a[l] = (acc[0][l] + acc[2][l]) + (acc[1][l] + acc[3][l]);
+        }
+        let mut sum = hadd_reduce8(&a);
+        for k in np..n {
+            sum = x[k].mul_add(y[k], sum);
+        }
+        sum
     }
-    let mut a = [0.0f32; 8];
-    for l in 0..8 {
-        a[l] = (acc[0][l] + acc[2][l]) + (acc[1][l] + acc[3][l]);
-    }
-    let mut sum = hadd_reduce8(&a);
-    for k in np..n {
-        sum = x[k].mul_add(y[k], sum);
-    }
-    sum
 }
 
 /// BF16 bits to f32.
@@ -852,25 +882,28 @@ pub fn fwht_blocks(x: &mut [f32], block: usize) {
     fwht_blocks_scalar(x, block)
 }
 
-/// The definition of [`fwht_blocks`] (portable code). Every output of a butterfly stage depends only on two values
-/// of the previous stage, so any vector schedule of the same stages gives the same bits.
-pub fn fwht_blocks_scalar(x: &mut [f32], block: usize) {
-    assert!(block.is_power_of_two() && x.len().is_multiple_of(block));
-    let scale = 1.0 / (block as f32).sqrt();
-    for row in x.chunks_exact_mut(block) {
-        for v in row.iter_mut() {
-            *v *= scale;
-        }
-        let mut len = 1;
-        while len < block {
-            for i in (0..block).step_by(2 * len) {
-                for j in i..i + len {
-                    let (u, v) = (row[j], row[j + len]);
-                    row[j] = u + v;
-                    row[j + len] = u - v;
-                }
+multiversion! {
+    /// The definition of [`fwht_blocks`] (portable code). Every output of a butterfly stage depends only on two values
+    /// of the previous stage, so any vector schedule of the same stages gives the same bits (the AVX2 version of this
+    /// body lets the compiler vectorize the stages, module `dispatch`).
+    pub fn fwht_blocks_scalar(x: &mut [f32], block: usize) {
+        assert!(block.is_power_of_two() && x.len().is_multiple_of(block));
+        let scale = 1.0 / (block as f32).sqrt();
+        for row in x.chunks_exact_mut(block) {
+            for v in row.iter_mut() {
+                *v *= scale;
             }
-            len <<= 1;
+            let mut len = 1;
+            while len < block {
+                for i in (0..block).step_by(2 * len) {
+                    for j in i..i + len {
+                        let (u, v) = (row[j], row[j + len]);
+                        row[j] = u + v;
+                        row[j + len] = u - v;
+                    }
+                }
+                len <<= 1;
+            }
         }
     }
 }
@@ -894,17 +927,21 @@ pub fn quantize_q8_0(x: &[f32], qs: &mut [i8], d: &mut [f32]) {
     quantize_q8_0_scalar(x, qs, d)
 }
 
-/// The definition of [`quantize_q8_0`] (portable code). NaN values are ignored by `amax` and give the code 0.
-pub fn quantize_q8_0_scalar(x: &[f32], qs: &mut [i8], d: &mut [f32]) {
-    assert!(x.len().is_multiple_of(32), "Q8_0 quantization needs whole blocks of 32 values");
-    assert_eq!(qs.len(), x.len());
-    assert_eq!(d.len(), x.len() / 32);
-    for ((xb, qb), db) in x.chunks_exact(32).zip(qs.chunks_exact_mut(32)).zip(d.iter_mut()) {
-        let amax = xb.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        *db = f16_to_f32(f32_to_f16(amax / 127.0));
-        let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-        for (q, &v) in qb.iter_mut().zip(xb) {
-            *q = ((v * id).round_ties_even() as i32).clamp(-128, 127) as i8;
+multiversion! {
+    /// The definition of [`quantize_q8_0`] (portable code). NaN values are ignored by `amax` and give the code 0. On
+    /// x86-64 it runs with the hardware rounding and conversion instructions when the CPU has them (same bits, see
+    /// module `dispatch`).
+    pub fn quantize_q8_0_scalar(x: &[f32], qs: &mut [i8], d: &mut [f32]) {
+        assert!(x.len().is_multiple_of(32), "Q8_0 quantization needs whole blocks of 32 values");
+        assert_eq!(qs.len(), x.len());
+        assert_eq!(d.len(), x.len() / 32);
+        for ((xb, qb), db) in x.chunks_exact(32).zip(qs.chunks_exact_mut(32)).zip(d.iter_mut()) {
+            let amax = xb.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            *db = H::to_f32(H::to_f16(amax / 127.0));
+            let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+            for (q, &v) in qb.iter_mut().zip(xb) {
+                *q = ((v * id).round_ties_even() as i32).clamp(-128, 127) as i8;
+            }
         }
     }
 }
@@ -958,6 +995,71 @@ pub fn f32_to_f16_soft(f: f32) -> u16 {
 #[inline]
 pub fn round_f16(f: f32) -> f32 {
     f16_to_f32(f32_to_f16(f))
+}
+
+/// `dst[i] = f32_to_f16(src[i])` for every element (round to nearest even). Eight values per instruction where the
+/// CPU has F16C; the result is the same as the element-wise conversion.
+pub fn f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
+    assert_eq!(src.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::dispatch::has_avx2_fma_f16c() {
+            // SAFETY: AVX2 and F16C are available; the lengths are equal.
+            unsafe { f32_to_f16_slice_avx2(src, dst) };
+            return;
+        }
+    }
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = f32_to_f16(s);
+    }
+}
+
+/// `dst[i] = f16_to_f32(src[i])` for every element (exact). Eight values per instruction where the CPU has F16C.
+pub fn f16_to_f32_slice(src: &[u16], dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::dispatch::has_avx2_fma_f16c() {
+            // SAFETY: AVX2 and F16C are available; the lengths are equal.
+            unsafe { f16_to_f32_slice_avx2(src, dst) };
+            return;
+        }
+    }
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = f16_to_f32(s);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn f32_to_f16_slice_avx2(src: &[f32], dst: &mut [u16]) {
+    let n = src.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let h = _mm256_cvtps_ph::<0>(_mm256_loadu_ps(src.as_ptr().add(i)));
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, h);
+        i += 8;
+    }
+    while i < n {
+        dst[i] = _mm_cvtsi128_si32(_mm_cvtps_ph::<0>(_mm_set_ss(src[i]))) as u16;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn f16_to_f32_slice_avx2(src: &[u16], dst: &mut [f32]) {
+    let n = src.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let f = _mm256_cvtph_ps(_mm_loadu_si128(src.as_ptr().add(i) as *const __m128i));
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), f);
+        i += 8;
+    }
+    while i < n {
+        dst[i] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(src[i] as i32)));
+        i += 1;
+    }
 }
 
 /// AVX2/FMA/F16C implementation of [`ggml_vec_dot_f16`].
@@ -1064,17 +1166,20 @@ unsafe fn ggml_vec_dot_f16_neon(x: &[u16], y: &[u16]) -> f32 {
     sumf
 }
 
-/// Sequential scalar dot product: the portable fallback and the former AArch64 behaviour.
-pub fn ggml_vec_dot_f16_scalar(x: &[u16], y: &[u16]) -> f32 {
-    let mut sumf = 0.0f32;
-    for i in 0..x.len() {
-        sumf += f16_to_f32(x[i]) * f16_to_f32(y[i]);
+multiversion! {
+    /// Sequential scalar dot product: the portable fallback and the former AArch64 behaviour.
+    pub fn ggml_vec_dot_f16_scalar(x: &[u16], y: &[u16]) -> f32 {
+        let mut sumf = 0.0f32;
+        for i in 0..x.len() {
+            sumf += H::to_f32(x[i]) * H::to_f32(y[i]);
+        }
+        sumf
     }
-    sumf
 }
 
 /// Computes exact half-precision dot product matching ggml_vec_dot_f16 with 4-way FMA accumulation and pairwise
 /// reduction: AVX2 on x86-64, NEON with the identical operation order on AArch64, sequential scalar elsewhere.
+#[inline]
 pub fn ggml_vec_dot_f16(x: &[u16], y: &[u16]) -> f32 {
     assert_eq!(x.len(), y.len());
     #[cfg(target_arch = "x86_64")]
@@ -1100,48 +1205,8 @@ pub fn vec_dot_f32_f16(q: &[f32], k_f16: &[u16]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
-            unsafe {
-                let np = n & !31;
-                let mut sum0 = _mm256_setzero_ps();
-                let mut sum1 = _mm256_setzero_ps();
-                let mut sum2 = _mm256_setzero_ps();
-                let mut sum3 = _mm256_setzero_ps();
-
-                let mut i = 0;
-                while i < np {
-                    let k0 = _mm256_cvtph_ps(_mm_loadu_si128(k_f16.as_ptr().add(i) as *const __m128i));
-                    let q0 = _mm256_loadu_ps(q.as_ptr().add(i));
-                    sum0 = _mm256_fmadd_ps(q0, k0, sum0);
-
-                    let k1 = _mm256_cvtph_ps(_mm_loadu_si128(k_f16.as_ptr().add(i + 8) as *const __m128i));
-                    let q1 = _mm256_loadu_ps(q.as_ptr().add(i + 8));
-                    sum1 = _mm256_fmadd_ps(q1, k1, sum1);
-
-                    let k2 = _mm256_cvtph_ps(_mm_loadu_si128(k_f16.as_ptr().add(i + 16) as *const __m128i));
-                    let q2 = _mm256_loadu_ps(q.as_ptr().add(i + 16));
-                    sum2 = _mm256_fmadd_ps(q2, k2, sum2);
-
-                    let k3 = _mm256_cvtph_ps(_mm_loadu_si128(k_f16.as_ptr().add(i + 24) as *const __m128i));
-                    let q3 = _mm256_loadu_ps(q.as_ptr().add(i + 24));
-                    sum3 = _mm256_fmadd_ps(q3, k3, sum3);
-
-                    i += 32;
-                }
-
-                let red0 = _mm256_add_ps(sum0, sum2);
-                let red1 = _mm256_add_ps(sum1, sum3);
-                let red = _mm256_add_ps(red0, red1);
-
-                let t0 = _mm_add_ps(_mm256_castps256_ps128(red), _mm256_extractf128_ps(red, 1));
-                let t1 = _mm_hadd_ps(t0, t0);
-                let mut sumf = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
-
-                while i < n {
-                    sumf += q[i] * f16_to_f32(k_f16[i]);
-                    i += 1;
-                }
-                return sumf;
-            }
+            // SAFETY: AVX2, F16C and FMA are available; the lengths are equal.
+            return unsafe { vec_dot_f32_f16_avx2(q, k_f16) };
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -1158,6 +1223,54 @@ pub fn vec_dot_f32_f16(q: &[f32], k_f16: &[u16]) -> f32 {
     }
 }
 
+/// AVX2 [`vec_dot_f32_f16`]. The `target_feature` attribute makes the intrinsics inline in this body (see
+/// [`crate::dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn vec_dot_f32_f16_avx2(q: &[f32], k_f16: &[u16]) -> f32 {
+    let n = q.len();
+    let np = n & !31;
+    let mut sum0 = _mm256_setzero_ps();
+    let mut sum1 = _mm256_setzero_ps();
+    let mut sum2 = _mm256_setzero_ps();
+    let mut sum3 = _mm256_setzero_ps();
+
+    let mut i = 0;
+    while i < np {
+        let k0 = _mm256_cvtph_ps(_mm_loadu_si128(k_f16.as_ptr().add(i) as *const __m128i));
+        let q0 = _mm256_loadu_ps(q.as_ptr().add(i));
+        sum0 = _mm256_fmadd_ps(q0, k0, sum0);
+
+        let k1 = _mm256_cvtph_ps(_mm_loadu_si128(k_f16.as_ptr().add(i + 8) as *const __m128i));
+        let q1 = _mm256_loadu_ps(q.as_ptr().add(i + 8));
+        sum1 = _mm256_fmadd_ps(q1, k1, sum1);
+
+        let k2 = _mm256_cvtph_ps(_mm_loadu_si128(k_f16.as_ptr().add(i + 16) as *const __m128i));
+        let q2 = _mm256_loadu_ps(q.as_ptr().add(i + 16));
+        sum2 = _mm256_fmadd_ps(q2, k2, sum2);
+
+        let k3 = _mm256_cvtph_ps(_mm_loadu_si128(k_f16.as_ptr().add(i + 24) as *const __m128i));
+        let q3 = _mm256_loadu_ps(q.as_ptr().add(i + 24));
+        sum3 = _mm256_fmadd_ps(q3, k3, sum3);
+
+        i += 32;
+    }
+
+    let red0 = _mm256_add_ps(sum0, sum2);
+    let red1 = _mm256_add_ps(sum1, sum3);
+    let red = _mm256_add_ps(red0, red1);
+
+    let t0 = _mm_add_ps(_mm256_castps256_ps128(red), _mm256_extractf128_ps(red, 1));
+    let t1 = _mm_hadd_ps(t0, t0);
+    let mut sumf = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
+
+    while i < n {
+        sumf += q[i] * f16_to_f32(k_f16[i]);
+        i += 1;
+    }
+    sumf
+}
+
 /// Accumulates scaled F16 values into an F32 output vector: `out[i] += f16_to_f32(v_f16[i]) * scale`.
 pub fn vec_mad_f32_f16(out: &mut [f32], v_f16: &[u16], scale: f32) {
     assert_eq!(out.len(), v_f16.len());
@@ -1166,23 +1279,9 @@ pub fn vec_mad_f32_f16(out: &mut [f32], v_f16: &[u16], scale: f32) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
-            unsafe {
-                let np = n & !7;
-                let v_scale = _mm256_set1_ps(scale);
-                let mut i = 0;
-                while i < np {
-                    let v_val = _mm256_cvtph_ps(_mm_loadu_si128(v_f16.as_ptr().add(i) as *const __m128i));
-                    let cur_out = _mm256_loadu_ps(out.as_ptr().add(i));
-                    let res = _mm256_fmadd_ps(v_val, v_scale, cur_out);
-                    _mm256_storeu_ps(out.as_mut_ptr().add(i), res);
-                    i += 8;
-                }
-                while i < n {
-                    out[i] += f16_to_f32(v_f16[i]) * scale;
-                    i += 1;
-                }
-                return;
-            }
+            // SAFETY: AVX2, F16C and FMA are available; the lengths are equal.
+            unsafe { vec_mad_f32_f16_avx2(out, v_f16, scale) };
+            return;
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -1196,6 +1295,28 @@ pub fn vec_mad_f32_f16(out: &mut [f32], v_f16: &[u16], scale: f32) {
     }
 }
 
+/// AVX2 [`vec_mad_f32_f16`]. The `target_feature` attribute makes the intrinsics inline in this body (see
+/// [`crate::dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn vec_mad_f32_f16_avx2(out: &mut [f32], v_f16: &[u16], scale: f32) {
+    let n = out.len();
+    let np = n & !7;
+    let v_scale = _mm256_set1_ps(scale);
+    let mut i = 0;
+    while i < np {
+        let v_val = _mm256_cvtph_ps(_mm_loadu_si128(v_f16.as_ptr().add(i) as *const __m128i));
+        let cur_out = _mm256_loadu_ps(out.as_ptr().add(i));
+        let res = _mm256_fmadd_ps(v_val, v_scale, cur_out);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), res);
+        i += 8;
+    }
+    while i < n {
+        out[i] += f16_to_f32(v_f16[i]) * scale;
+        i += 1;
+    }
+}
+
 /// Evaluates in-place softmax matching ggml_vec_soft_max_f32: computes `x[i] = exp(x[i] - max)` and returns `sum(x)`.
 pub fn ggml_vec_soft_max_f32(x: &mut [f32], max: f32) -> f32 {
     #[allow(unused_variables)]
@@ -1203,35 +1324,8 @@ pub fn ggml_vec_soft_max_f32(x: &mut [f32], max: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe {
-                let mut i = 0;
-                let mut sum: f64 = 0.0;
-                let v_max = _mm256_set1_ps(max);
-
-                while i + 8 <= n {
-                    let ptr = x.as_mut_ptr().add(i);
-                    let vx = _mm256_loadu_ps(ptr);
-                    let diff = _mm256_sub_ps(vx, v_max);
-                    let val = ggml_v_expf_avx2(diff);
-                    _mm256_storeu_ps(ptr, val);
-
-                    let val2 = _mm_add_ps(_mm256_extractf128_ps(val, 1), _mm256_castps256_ps128(val));
-                    let val2 = _mm_add_ps(val2, _mm_movehl_ps(val2, val2));
-                    let val2 = _mm_add_ss(val2, _mm_movehdup_ps(val2));
-                    sum += _mm_cvtss_f32(val2) as f64;
-
-                    i += 8;
-                }
-
-                while i < n {
-                    let val = (x[i] - max).exp();
-                    x[i] = val;
-                    sum += val as f64;
-                    i += 1;
-                }
-
-                return sum as f32;
-            }
+            // SAFETY: AVX2 and FMA are available.
+            return unsafe { ggml_vec_soft_max_f32_avx2(x, max) };
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -1250,6 +1344,41 @@ pub fn ggml_vec_soft_max_f32(x: &mut [f32], max: f32) -> f32 {
     }
 }
 
+/// AVX2 [`ggml_vec_soft_max_f32`]. The `target_feature` attribute makes the intrinsics inline in this body (see
+/// [`crate::dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn ggml_vec_soft_max_f32_avx2(x: &mut [f32], max: f32) -> f32 {
+    let n = x.len();
+    let mut i = 0;
+    let mut sum: f64 = 0.0;
+    let v_max = _mm256_set1_ps(max);
+
+    while i + 8 <= n {
+        let ptr = x.as_mut_ptr().add(i);
+        let vx = _mm256_loadu_ps(ptr);
+        let diff = _mm256_sub_ps(vx, v_max);
+        let val = ggml_v_expf_avx2(diff);
+        _mm256_storeu_ps(ptr, val);
+
+        let val2 = _mm_add_ps(_mm256_extractf128_ps(val, 1), _mm256_castps256_ps128(val));
+        let val2 = _mm_add_ps(val2, _mm_movehl_ps(val2, val2));
+        let val2 = _mm_add_ss(val2, _mm_movehdup_ps(val2));
+        sum += _mm_cvtss_f32(val2) as f64;
+
+        i += 8;
+    }
+
+    while i < n {
+        let val = (x[i] - max).exp();
+        x[i] = val;
+        sum += val as f64;
+        i += 1;
+    }
+
+    sum as f32
+}
+
 /// In-place vector multiply-add in FP16 precision: $y_i = \text{round}_{\text{f16}}(y_i + x_i \times v)$.
 pub fn ggml_vec_mad_f16(y: &mut [u16], x: &[u16], v: f32) {
     assert_eq!(y.len(), x.len());
@@ -1258,33 +1387,9 @@ pub fn ggml_vec_mad_f16(y: &mut [u16], x: &[u16], v: f32) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
-            unsafe {
-                let np = n & !31;
-                let vx = _mm256_set1_ps(v);
-
-                let mut i = 0;
-                while i < np {
-                    for j in 0..4 {
-                        let offset = i + j * 8;
-                        let ax = _mm256_cvtph_ps(_mm_loadu_si128(x.as_ptr().add(offset) as *const __m128i));
-                        let ay = _mm256_cvtph_ps(_mm_loadu_si128(y.as_ptr().add(offset) as *const __m128i));
-                        let res = _mm256_fmadd_ps(ax, vx, ay);
-                        _mm_storeu_si128(
-                            y.as_mut_ptr().add(offset) as *mut __m128i,
-                            _mm256_cvtps_ph::<0>(res),
-                        );
-                    }
-                    i += 32;
-                }
-
-                while i < n {
-                    let fy = f16_to_f32(y[i]);
-                    let fx = f16_to_f32(x[i]);
-                    y[i] = f32_to_f16(fy + fx * v);
-                    i += 1;
-                }
-                return;
-            }
+            // SAFETY: AVX2, F16C and FMA are available; the lengths are equal.
+            unsafe { ggml_vec_mad_f16_avx2(y, x, v) };
+            return;
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -1300,6 +1405,35 @@ pub fn ggml_vec_mad_f16(y: &mut [u16], x: &[u16], v: f32) {
     }
 }
 
+/// AVX2 [`ggml_vec_mad_f16`]. The `target_feature` attribute makes the intrinsics inline in this body (see
+/// [`crate::dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn ggml_vec_mad_f16_avx2(y: &mut [u16], x: &[u16], v: f32) {
+    let n = y.len();
+    let np = n & !31;
+    let vx = _mm256_set1_ps(v);
+
+    let mut i = 0;
+    while i < np {
+        for j in 0..4 {
+            let offset = i + j * 8;
+            let ax = _mm256_cvtph_ps(_mm_loadu_si128(x.as_ptr().add(offset) as *const __m128i));
+            let ay = _mm256_cvtph_ps(_mm_loadu_si128(y.as_ptr().add(offset) as *const __m128i));
+            let res = _mm256_fmadd_ps(ax, vx, ay);
+            _mm_storeu_si128(y.as_mut_ptr().add(offset) as *mut __m128i, _mm256_cvtps_ph::<0>(res));
+        }
+        i += 32;
+    }
+
+    while i < n {
+        let fy = f16_to_f32(y[i]);
+        let fx = f16_to_f32(x[i]);
+        y[i] = f32_to_f16(fy + fx * v);
+        i += 1;
+    }
+}
+
 /// In-place vector scaling in FP16 precision: $y_i = \text{round}_{\text{f16}}(y_i \times v)$.
 pub fn ggml_vec_scale_f16(y: &mut [u16], v: f32) {
     #[allow(unused_variables)]
@@ -1307,31 +1441,9 @@ pub fn ggml_vec_scale_f16(y: &mut [u16], v: f32) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
-            unsafe {
-                let np = n & !31;
-                let vx = _mm256_set1_ps(v);
-
-                let mut i = 0;
-                while i < np {
-                    for j in 0..4 {
-                        let offset = i + j * 8;
-                        let ay = _mm256_cvtph_ps(_mm_loadu_si128(y.as_ptr().add(offset) as *const __m128i));
-                        let res = _mm256_mul_ps(ay, vx);
-                        _mm_storeu_si128(
-                            y.as_mut_ptr().add(offset) as *mut __m128i,
-                            _mm256_cvtps_ph::<0>(res),
-                        );
-                    }
-                    i += 32;
-                }
-
-                while i < n {
-                    let fy = f16_to_f32(y[i]);
-                    y[i] = f32_to_f16(fy * v);
-                    i += 1;
-                }
-                return;
-            }
+            // SAFETY: AVX2 and F16C are available.
+            unsafe { ggml_vec_scale_f16_avx2(y, v) };
+            return;
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -1343,6 +1455,33 @@ pub fn ggml_vec_scale_f16(y: &mut [u16], v: f32) {
     for i in 0..n {
         let fy = f16_to_f32(y[i]);
         y[i] = f32_to_f16(fy * v);
+    }
+}
+
+/// AVX2 [`ggml_vec_scale_f16`]. The `target_feature` attribute makes the intrinsics inline in this body (see
+/// [`crate::dispatch`]).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn ggml_vec_scale_f16_avx2(y: &mut [u16], v: f32) {
+    let n = y.len();
+    let np = n & !31;
+    let vx = _mm256_set1_ps(v);
+
+    let mut i = 0;
+    while i < np {
+        for j in 0..4 {
+            let offset = i + j * 8;
+            let ay = _mm256_cvtph_ps(_mm_loadu_si128(y.as_ptr().add(offset) as *const __m128i));
+            let res = _mm256_mul_ps(ay, vx);
+            _mm_storeu_si128(y.as_mut_ptr().add(offset) as *mut __m128i, _mm256_cvtps_ph::<0>(res));
+        }
+        i += 32;
+    }
+
+    while i < n {
+        let fy = f16_to_f32(y[i]);
+        y[i] = f32_to_f16(fy * v);
+        i += 1;
     }
 }
 
@@ -1519,8 +1658,15 @@ pub fn ggml_vec_mad_f16_f32(acc: &mut [f32], v: &[u16], s: f32) {
             i += 4;
         }
     }
-    for k in i..acc.len() {
-        acc[k] = f16_to_f32(v[k]).mul_add(s, acc[k]);
+    mad_f16_f32_from(acc, v, s, i);
+}
+
+multiversion! {
+    /// The elements `from..` of [`ggml_vec_mad_f16_f32`] (everything the vector loops did not do).
+    fn mad_f16_f32_from(acc: &mut [f32], v: &[u16], s: f32, from: usize) {
+        for k in from..acc.len() {
+            acc[k] = H::to_f32(v[k]).mul_add(s, acc[k]);
+        }
     }
 }
 
@@ -2175,6 +2321,103 @@ mod tests {
         println!("OPS_CHECKSUM vec_scale_f16 {h_scale:016x}");
         println!("OPS_CHECKSUM vec_dot_f32_f16 {h_dot:016x}");
         println!("OPS_CHECKSUM vec_mad_f32_f16 {h_madf32:016x}");
+    }
+
+    /// The slice conversions give the bits of the element-wise ones for every length (vector body and tail) and for
+    /// special values (zeros, subnormals, infinities, NaN, values at the rounding boundaries).
+    #[test]
+    fn half_slice_conversions_equal_the_elementwise_ones() {
+        let mut next = test_rng(0x5EED_0123_4567_89AB);
+        let specials = [0.0f32, -0.0, 1.0, 65504.0, 65520.0, 1e-8, 5.960_464_5e-8, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        for n in 0..70usize {
+            let src: Vec<f32> = (0..n)
+                .map(|i| if i % 5 == 0 { specials[(next() % 10) as usize] } else { f32::from_bits(next() as u32) })
+                .collect();
+            let mut got = vec![0u16; n];
+            f32_to_f16_slice(&src, &mut got);
+            for i in 0..n {
+                let want = f32_to_f16(src[i]);
+                assert!(got[i] == want || (src[i].is_nan() && (got[i] & 0x7C00) == 0x7C00), "n={n} i={i}");
+            }
+            let halves: Vec<u16> = (0..n).map(|_| next() as u16).collect();
+            let mut back = vec![0.0f32; n];
+            f16_to_f32_slice(&halves, &mut back);
+            for i in 0..n {
+                let want = f16_to_f32(halves[i]);
+                assert!(back[i].to_bits() == want.to_bits() || (back[i].is_nan() && want.is_nan()), "n={n} i={i}");
+            }
+        }
+    }
+
+    /// Results of every function made with `multiversion!` (and of the ones that call it) over many inputs.
+    fn multiversion_results() -> Vec<u32> {
+        let mut next = test_rng(0xA11C_E5ED_0000_0007);
+        let mut out = Vec::new();
+        for &n in &[0usize, 1, 7, 8, 31, 32, 33, 100, 256, 293] {
+            let halves: Vec<u16> = (0..n).map(|_| f32_to_f16(rand_f32(&mut next, 4.0))).collect();
+            let q: Vec<f32> = (0..n).map(|_| rand_f32(&mut next, 2.0)).collect();
+            out.push(ggml_vec_dot_f16_f32_scalar(&halves, &q).to_bits());
+            out.push(ggml_vec_dot_f32_scalar(&q, &q.iter().rev().cloned().collect::<Vec<_>>()).to_bits());
+            out.push(ggml_vec_dot_f16_scalar(&halves, &halves.iter().rev().cloned().collect::<Vec<_>>()).to_bits());
+            let mut acc = q.clone();
+            ggml_vec_mad_f16_f32(&mut acc, &halves, rand_f32(&mut next, 3.0));
+            out.extend(acc.iter().map(|v| v.to_bits()));
+        }
+        for &blocks in &[1usize, 3, 8] {
+            let x: Vec<f32> = (0..32 * blocks).map(|i| if i % 29 == 0 { 0.0 } else { rand_f32(&mut next, 5.0) }).collect();
+            let (mut qs, mut d) = (vec![0i8; x.len()], vec![0.0f32; blocks]);
+            quantize_q8_0_scalar(&x, &mut qs, &mut d);
+            out.extend(qs.iter().map(|&v| v as u8 as u32));
+            out.extend(d.iter().map(|v| v.to_bits()));
+        }
+        for &block in &[1usize, 2, 16, 64, 128] {
+            let mut x: Vec<f32> = (0..2 * block).map(|_| rand_f32(&mut next, 1.0)).collect();
+            fwht_blocks_scalar(&mut x, block);
+            out.extend(x.iter().map(|v| v.to_bits()));
+        }
+        out
+    }
+
+    /// Every version of a `multiversion!` function (baseline and AVX2 + FMA + F16C) gives the same bits, and the
+    /// dot products equal the modelled order of operations written without the macro.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn multiversion_versions_give_identical_bits() {
+        let extended = multiversion_results();
+        let baseline = crate::dispatch::with_baseline(multiversion_results);
+        assert_eq!(extended, baseline);
+    }
+
+    /// The dot products of the scalar definitions equal an independent model of their operation order.
+    #[test]
+    fn scalar_dot_products_follow_their_modelled_order() {
+        let mut next = test_rng(0x0DD5_0123_0000_0042);
+        for &n in &[1usize, 8, 31, 32, 33, 100, 293] {
+            let halves: Vec<u16> = (0..n).map(|_| f32_to_f16(rand_f32(&mut next, 4.0))).collect();
+            let y: Vec<f32> = (0..n).map(|_| rand_f32(&mut next, 2.0)).collect();
+            // `ggml_vec_dot_f32`: four accumulators of eight lanes, `(a0 + a2) + (a1 + a3)`, tail fused one by one.
+            let np = n & !31;
+            let mut acc = [[0.0f32; 8]; 4];
+            for i in (0..np).step_by(32) {
+                for j in 0..4 {
+                    for l in 0..8 {
+                        acc[j][l] = f16_to_f32(halves[i + 8 * j + l]).mul_add(y[i + 8 * j + l], acc[j][l]);
+                    }
+                }
+            }
+            let mut sum = {
+                let mut a = [0.0f32; 8];
+                for l in 0..8 {
+                    a[l] = (acc[0][l] + acc[2][l]) + (acc[1][l] + acc[3][l]);
+                }
+                hadd_reduce8(&a)
+            };
+            let xs: Vec<f32> = halves.iter().map(|&h| f16_to_f32(h)).collect();
+            for k in np..n {
+                sum = xs[k].mul_add(y[k], sum);
+            }
+            assert_eq!(ggml_vec_dot_f32_scalar(&xs, &y).to_bits(), sum.to_bits(), "n={n}");
+        }
     }
 
     /// The glibc port of `log1pf`: on x86-64 Linux it must equal the C library for a dense sample of all inputs, and its

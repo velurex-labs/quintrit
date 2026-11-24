@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 460" role="img" aria-label="Ternary Nemotron 3.5 Lightning: scaling with the number of threads: tokens per second against the number of threads">
+<style>svg{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}:root{--bg:#fcfcfb;--t1:#0b0b0b;--t2:#52514e;--grid:#e3e2de;--axis:#9a998f;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;}@media (prefers-color-scheme:dark){:root{--bg:#1a1a19;--t1:#f0efec;--t2:#c3c2b7;--grid:#34332f;--axis:#6b6a63;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;}}.bg{fill:var(--bg)}.t1{fill:var(--t1)}.t2{fill:var(--t2)}.grid{stroke:var(--grid);stroke-width:1}.axis{stroke:var(--axis);stroke-width:1}.ring{stroke:var(--bg);stroke-width:2}.l1{stroke:var(--s1);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m1{fill:var(--s1)}.l2{stroke:var(--s2);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m2{fill:var(--s2)}.l3{stroke:var(--s3);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m3{fill:var(--s3)}.l4{stroke:var(--s4);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m4{fill:var(--s4)}</style>
+<rect class="bg" width="800" height="460"/>
+<text class="t1" x="80" y="30" font-size="17" font-weight="600">Ternary Nemotron 3.5 Lightning: scaling with the number of threads</text>
+<text class="t2" x="80" y="50" font-size="12">Decode speed in generated tokens per second, standard prompt, 256 greedy tokens, median of 3 runs (5 at the highest thread count)</text>
+<rect class="m1" x="80" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="95" y="75" font-size="12">EPYC 9V45 (AVX-512)</text>
+<rect class="m2" x="242.39999999999998" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="257.4" y="75" font-size="12">Neoverse-N2 (NEON)</text>
+<rect class="m3" x="398.2" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="413.2" y="75" font-size="12">i7-7700 (AVX2)</text>
+<line class="grid" x1="80" x2="600" y1="390.0" y2="390.0"/>
+<text class="t2" x="70" y="394.0" font-size="12" text-anchor="end">0</text>
+<line class="grid" x1="80" x2="600" y1="340.3" y2="340.3"/>
+<text class="t2" x="70" y="344.3" font-size="12" text-anchor="end">5</text>
+<line class="grid" x1="80" x2="600" y1="290.7" y2="290.7"/>
+<text class="t2" x="70" y="294.7" font-size="12" text-anchor="end">10</text>
+<line class="grid" x1="80" x2="600" y1="241.0" y2="241.0"/>
+<text class="t2" x="70" y="245.0" font-size="12" text-anchor="end">15</text>
+<line class="grid" x1="80" x2="600" y1="191.3" y2="191.3"/>
+<text class="t2" x="70" y="195.3" font-size="12" text-anchor="end">20</text>
+<line class="grid" x1="80" x2="600" y1="141.7" y2="141.7"/>
+<text class="t2" x="70" y="145.7" font-size="12" text-anchor="end">25</text>
+<line class="grid" x1="80" x2="600" y1="92.0" y2="92.0"/>
+<text class="t2" x="70" y="96.0" font-size="12" text-anchor="end">30</text>
+<line class="axis" x1="80" x2="600" y1="390.0" y2="390.0"/>
+<text class="t2" x="100.0" y="410.0" font-size="12" text-anchor="middle">1</text>
+<text class="t2" x="260.0" y="410.0" font-size="12" text-anchor="middle">2</text>
+<text class="t2" x="420.0" y="410.0" font-size="12" text-anchor="middle">4</text>
+<text class="t2" x="580.0" y="410.0" font-size="12" text-anchor="middle">8</text>
+<text class="t2" x="340.0" y="436" font-size="12" text-anchor="middle">threads</text>
+<text class="t2" x="18" y="241.0" font-size="12" text-anchor="middle" transform="rotate(-90 18 241.0)">tokens per second</text>
+<path class="l1" d="M100.0,204.4 L260.0,139.1 L420.0,130.3"/>
+<circle class="m1 ring" cx="100.0" cy="204.4" r="5"><title>EPYC 9V45 (AVX-512), 1 thread: 18.68 tokens/s (min 18.55, max 18.72)</title></circle>
+<circle class="m1 ring" cx="260.0" cy="139.1" r="5"><title>EPYC 9V45 (AVX-512), 2 threads: 25.26 tokens/s (min 24.92, max 25.50)</title></circle>
+<circle class="m1 ring" cx="420.0" cy="130.3" r="5"><title>EPYC 9V45 (AVX-512), 4 threads: 26.15 tokens/s (min 25.98, max 26.40)</title></circle>
+<path class="l2" d="M100.0,349.4 L260.0,316.4 L420.0,264.6 L580.0,195.9"/>
+<circle class="m2 ring" cx="100.0" cy="349.4" r="5"><title>Neoverse-N2 (NEON), 1 thread: 4.09 tokens/s (min 4.08, max 4.09)</title></circle>
+<circle class="m2 ring" cx="260.0" cy="316.4" r="5"><title>Neoverse-N2 (NEON), 2 threads: 7.41 tokens/s (min 7.39, max 7.44)</title></circle>
+<circle class="m2 ring" cx="420.0" cy="264.6" r="5"><title>Neoverse-N2 (NEON), 4 threads: 12.62 tokens/s (min 12.57, max 12.65)</title></circle>
+<circle class="m2 ring" cx="580.0" cy="195.9" r="5"><title>Neoverse-N2 (NEON), 8 threads: 19.54 tokens/s (min 19.51, max 19.55)</title></circle>
+<path class="l3" d="M100.0,365.0 L260.0,347.2 L420.0,316.8 L580.0,308.3"/>
+<circle class="m3 ring" cx="100.0" cy="365.0" r="5"><title>i7-7700 (AVX2), 1 thread: 2.52 tokens/s (min 2.52, max 2.52)</title></circle>
+<circle class="m3 ring" cx="260.0" cy="347.2" r="5"><title>i7-7700 (AVX2), 2 threads: 4.31 tokens/s (min 4.27, max 4.31)</title></circle>
+<circle class="m3 ring" cx="420.0" cy="316.8" r="5"><title>i7-7700 (AVX2), 4 threads: 7.37 tokens/s (min 7.35, max 7.38)</title></circle>
+<circle class="m3 ring" cx="580.0" cy="308.3" r="5"><title>i7-7700 (AVX2), 8 threads: 8.22 tokens/s (min 8.21, max 8.22)</title></circle>
+<text class="t1" x="432.0" y="134.3" font-size="12">26.15</text>
+<text class="t1" x="592.0" y="199.9" font-size="12">19.54</text>
+<text class="t1" x="592.0" y="312.3" font-size="12">8.22</text>
+</svg>

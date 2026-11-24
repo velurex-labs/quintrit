@@ -16,7 +16,7 @@ The backend is tested on an A100 (8.0), an RTX 3070 (8.6) and an RTX 4060 (8.9);
 | GPU | NVIDIA, compute capability **8.0 or newer**: A100, RTX 30xx, RTX 40xx and later. Turing (RTX 20xx, GTX 16xx, T4) is not supported. |
 | Driver | Any driver that supports the GPU. It is loaded at run time (`libcuda.so.1`, `nvcuda.dll`); nothing of NVIDIA is linked at build time. |
 | Build | The CUDA Toolkit 13.x (`nvcc`; 12.8 also works). The kernels are compiled for compute capabilities 8.0, 8.6 and 8.9, and as PTX for newer GPUs. |
-| Models | `I2_S` models: BitNet b1.58, Falcon3, Falcon-E and LLaMA-style files. Block-scaled `Q2_0`, mixture-of-experts and hybrid models run on the CPU only; the GPU path reports an error that says why. |
+| Models | `I2_S` models (BitNet b1.58, Falcon3, Falcon-E and LLaMA-style files) and the block-scaled `Q2_0` models: the dense Ternary Bonsai models, the hybrid Qwen3.5 models (Ternary Bonsai 27B and Ternary Bonsai 2, with Gated DeltaNet layers and Hadamard-folded weights) and the mixture-of-experts model Ternary Nemotron 3.5 Lightning. Every result is bit-identical to the CPU path. Ternary Nemotron needs about 7.7 GiB of device memory. The C interface does not run block-scaled models on a GPU yet; the Rust API, the CLI and the Python package do. A model the GPU path does not support is refused with an error that says why. |
 | Memory | The weights (about 1.6 bits per weight, plus the 16-bit embedding and output head) and, per session, the KV cache: `2 × layers × kv heads × context × head dim × 2` bytes. Falcon3-10B with a context of 4096 tokens needs about 4.7 GB. |
 
 Head dimensions 32, 64, 128 and 256 are supported. The context window is at most 7936 tokens and defaults to the
@@ -51,7 +51,7 @@ maturin develop --release --features cuda                                       
 ```
 
 `--device cpu|cuda|cuda:<index>` chooses where the model runs (default `cpu`), and `--context <tokens>` bounds the
-context window on a GPU. `--threads` and `--kernel` do not apply to a GPU. `--bench` works as on the CPU.
+context window on a GPU. `--threads` and `--kernel` do not apply to a GPU. `--bench` works as on the CPU, except that it reports no weight traffic or memory bandwidth.
 
 ## Rust
 

@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 460" role="img" aria-label="BitNet b1.58 2B4T: scaling with the number of threads: tokens per second against the number of threads">
+<style>svg{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}:root{--bg:#fcfcfb;--t1:#0b0b0b;--t2:#52514e;--grid:#e3e2de;--axis:#9a998f;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;}@media (prefers-color-scheme:dark){:root{--bg:#1a1a19;--t1:#f0efec;--t2:#c3c2b7;--grid:#34332f;--axis:#6b6a63;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;}}.bg{fill:var(--bg)}.t1{fill:var(--t1)}.t2{fill:var(--t2)}.grid{stroke:var(--grid);stroke-width:1}.axis{stroke:var(--axis);stroke-width:1}.ring{stroke:var(--bg);stroke-width:2}.l1{stroke:var(--s1);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m1{fill:var(--s1)}.l2{stroke:var(--s2);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m2{fill:var(--s2)}.l3{stroke:var(--s3);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m3{fill:var(--s3)}.l4{stroke:var(--s4);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m4{fill:var(--s4)}</style>
+<rect class="bg" width="800" height="460"/>
+<text class="t1" x="80" y="30" font-size="17" font-weight="600">BitNet b1.58 2B4T: scaling with the number of threads</text>
+<text class="t2" x="80" y="50" font-size="12">Decode speed in generated tokens per second, standard prompt, 256 greedy tokens, median of 3 runs (5 at the highest thread count)</text>
+<rect class="m1" x="80" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="95" y="75" font-size="12">EPYC 9V45 (AVX-512)</text>
+<rect class="m2" x="242.39999999999998" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="257.4" y="75" font-size="12">Neoverse-N2 (NEON)</text>
+<rect class="m3" x="398.2" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="413.2" y="75" font-size="12">i7-7700 (AVX2)</text>
+<rect class="m4" x="527.5999999999999" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="542.5999999999999" y="75" font-size="12">Raspberry Pi 5 (NEON)</text>
+<line class="grid" x1="80" x2="600" y1="390.0" y2="390.0"/>
+<text class="t2" x="70" y="394.0" font-size="12" text-anchor="end">0</text>
+<line class="grid" x1="80" x2="600" y1="330.4" y2="330.4"/>
+<text class="t2" x="70" y="334.4" font-size="12" text-anchor="end">10</text>
+<line class="grid" x1="80" x2="600" y1="270.8" y2="270.8"/>
+<text class="t2" x="70" y="274.8" font-size="12" text-anchor="end">20</text>
+<line class="grid" x1="80" x2="600" y1="211.2" y2="211.2"/>
+<text class="t2" x="70" y="215.2" font-size="12" text-anchor="end">30</text>
+<line class="grid" x1="80" x2="600" y1="151.6" y2="151.6"/>
+<text class="t2" x="70" y="155.6" font-size="12" text-anchor="end">40</text>
+<line class="grid" x1="80" x2="600" y1="92.0" y2="92.0"/>
+<text class="t2" x="70" y="96.0" font-size="12" text-anchor="end">50</text>
+<line class="axis" x1="80" x2="600" y1="390.0" y2="390.0"/>
+<text class="t2" x="100.0" y="410.0" font-size="12" text-anchor="middle">1</text>
+<text class="t2" x="260.0" y="410.0" font-size="12" text-anchor="middle">2</text>
+<text class="t2" x="420.0" y="410.0" font-size="12" text-anchor="middle">4</text>
+<text class="t2" x="580.0" y="410.0" font-size="12" text-anchor="middle">8</text>
+<text class="t2" x="340.0" y="436" font-size="12" text-anchor="middle">threads</text>
+<text class="t2" x="18" y="241.0" font-size="12" text-anchor="middle" transform="rotate(-90 18 241.0)">tokens per second</text>
+<path class="l1" d="M100.0,214.2 L260.0,178.0 L420.0,164.7"/>
+<circle class="m1 ring" cx="100.0" cy="214.2" r="5"><title>EPYC 9V45 (AVX-512), 1 thread: 29.50 tokens/s (min 29.33, max 29.56)</title></circle>
+<circle class="m1 ring" cx="260.0" cy="178.0" r="5"><title>EPYC 9V45 (AVX-512), 2 threads: 35.57 tokens/s (min 35.00, max 35.67)</title></circle>
+<circle class="m1 ring" cx="420.0" cy="164.7" r="5"><title>EPYC 9V45 (AVX-512), 4 threads: 37.80 tokens/s (min 36.10, max 37.95)</title></circle>
+<path class="l2" d="M100.0,356.9 L260.0,329.8 L420.0,280.8 L580.0,223.8"/>
+<circle class="m2 ring" cx="100.0" cy="356.9" r="5"><title>Neoverse-N2 (NEON), 1 thread: 5.55 tokens/s (min 5.54, max 5.55)</title></circle>
+<circle class="m2 ring" cx="260.0" cy="329.8" r="5"><title>Neoverse-N2 (NEON), 2 threads: 10.10 tokens/s (min 10.10, max 10.11)</title></circle>
+<circle class="m2 ring" cx="420.0" cy="280.8" r="5"><title>Neoverse-N2 (NEON), 4 threads: 18.33 tokens/s (min 18.31, max 18.33)</title></circle>
+<circle class="m2 ring" cx="580.0" cy="223.8" r="5"><title>Neoverse-N2 (NEON), 8 threads: 27.88 tokens/s (min 27.82, max 27.95)</title></circle>
+<path class="l3" d="M100.0,320.3 L260.0,287.7 L420.0,256.2 L580.0,255.4"/>
+<circle class="m3 ring" cx="100.0" cy="320.3" r="5"><title>i7-7700 (AVX2), 1 thread: 11.70 tokens/s (min 11.69, max 11.71)</title></circle>
+<circle class="m3 ring" cx="260.0" cy="287.7" r="5"><title>i7-7700 (AVX2), 2 threads: 17.16 tokens/s (min 17.15, max 17.19)</title></circle>
+<circle class="m3 ring" cx="420.0" cy="256.2" r="5"><title>i7-7700 (AVX2), 4 threads: 22.45 tokens/s (min 22.43, max 22.47)</title></circle>
+<circle class="m3 ring" cx="580.0" cy="255.4" r="5"><title>i7-7700 (AVX2), 8 threads: 22.58 tokens/s (min 22.58, max 22.60)</title></circle>
+<path class="l4" d="M100.0,368.8 L260.0,349.8 L420.0,333.1"/>
+<circle class="m4 ring" cx="100.0" cy="368.8" r="5"><title>Raspberry Pi 5 (NEON), 1 thread: 3.56 tokens/s (min 3.56, max 3.56)</title></circle>
+<circle class="m4 ring" cx="260.0" cy="349.8" r="5"><title>Raspberry Pi 5 (NEON), 2 threads: 6.75 tokens/s (min 6.74, max 6.75)</title></circle>
+<circle class="m4 ring" cx="420.0" cy="333.1" r="5"><title>Raspberry Pi 5 (NEON), 4 threads: 9.55 tokens/s (min 9.53, max 9.55)</title></circle>
+<text class="t1" x="432.0" y="168.7" font-size="12">37.80</text>
+<text class="t1" x="592.0" y="227.8" font-size="12">27.88</text>
+<text class="t1" x="592.0" y="259.4" font-size="12">22.58</text>
+<text class="t1" x="432.0" y="337.1" font-size="12">9.55</text>
+</svg>

@@ -7,13 +7,14 @@
 //! projections and the recurrence, `ggml_vec_dot_bf16` for BF16 projections, the normalized Walsh-Hadamard transform
 //! of the PrismML Hadamard-folded weights (`prism.hadamard.*`), and flash attention with FP32 value accumulators.
 
-use crate::attention::attend_head;
+use crate::attention::{attend_heads, HeadsLayout};
 use crate::config::{ModelConfig, RopeConfig};
+use crate::dispatch::multiversion;
 use crate::kv_cache::KVCache;
 use crate::layer::LinearLayer;
 use crate::ops::{
-    add_residual, apply_rope, f16_to_f32, f32_to_bf16, f32_to_f16, fwht_blocks, ggml_vec_dot_bf16, ggml_vec_dot_f32,
-    quantize_q8_0, rms_norm, sigmoid_f32, silu, softplus_f32, swiglu,
+    add_residual, apply_rope, f16_to_f32, f32_to_bf16, f32_to_f16_slice, fwht_blocks, ggml_vec_dot_bf16,
+    ggml_vec_dot_f32, quantize_q8_0, rms_norm, sigmoid_f32, silu, softplus_f32, swiglu,
 };
 use quintrit_format::{GgufFile, GgufMetadataValue, GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q8_0};
 use rayon::prelude::*;
@@ -69,16 +70,16 @@ impl Hadamard {
 }
 
 /// The parsed `prism.hadamard.*` metadata.
-struct HadamardSpec {
-    block: usize,
-    weights: HashMap<String, ()>,
-    inverse: HashMap<String, ()>,
-    signs: HashMap<usize, Arc<Vec<f32>>>,
-    gdn_v_grouped: bool,
+pub(crate) struct HadamardSpec {
+    pub(crate) block: usize,
+    pub(crate) weights: HashMap<String, ()>,
+    pub(crate) inverse: HashMap<String, ()>,
+    pub(crate) signs: HashMap<usize, Arc<Vec<f32>>>,
+    pub(crate) gdn_v_grouped: bool,
 }
 
 impl HadamardSpec {
-    fn from_gguf(g: &GgufFile) -> Result<Option<Self>, String> {
+    pub(crate) fn from_gguf(g: &GgufFile) -> Result<Option<Self>, String> {
         let get = |k: &str| g.metadata.get(&format!("prism.hadamard.{k}"));
         let Some(version) = get("version").and_then(|v| v.as_u64()) else {
             return Ok(None);
@@ -162,7 +163,7 @@ impl HadamardSpec {
         Ok(Some(Self { block, weights, inverse, signs, gdn_v_grouped }))
     }
 
-    fn transform_for(&self, width: usize) -> Result<Hadamard, String> {
+    pub(crate) fn transform_for(&self, width: usize) -> Result<Hadamard, String> {
         if !width.is_multiple_of(self.block) {
             return Err(format!("prism.hadamard block size {} does not divide input width {width}", self.block));
         }
@@ -268,18 +269,64 @@ unsafe fn dot_q8_0_avx512(w: &[i8], wd: &[f32], a: &[i8], ad: &[f32]) -> f32 {
     }
 }
 
-/// The definition of [`dot_q8_0`] (portable code).
-pub fn dot_q8_0_scalar(w: &[i8], wd: &[f32], a: &[i8], ad: &[f32]) -> f32 {
-    let mut acc = [0.0f32; 8];
-    for (b, (wb, ab)) in w.chunks_exact(32).zip(a.chunks_exact(32)).enumerate() {
-        let d = wd[b] * ad[b];
-        for (j, lane) in acc.iter_mut().enumerate() {
-            let p: i32 = (4 * j..4 * j + 4).map(|k| wb[k] as i32 * ab[k] as i32).sum();
-            *lane = d.mul_add(p as f32, *lane);
+multiversion! {
+    /// The definition of [`dot_q8_0`] (portable code). On x86-64 it runs with fused multiply-adds when the CPU has
+    /// them (same bits, module `dispatch`).
+    pub fn dot_q8_0_scalar(w: &[i8], wd: &[f32], a: &[i8], ad: &[f32]) -> f32 {
+        let mut acc = [0.0f32; 8];
+        for (b, (wb, ab)) in w.chunks_exact(32).zip(a.chunks_exact(32)).enumerate() {
+            let d = wd[b] * ad[b];
+            for (j, lane) in acc.iter_mut().enumerate() {
+                let p: i32 = (4 * j..4 * j + 4).map(|k| wb[k] as i32 * ab[k] as i32).sum();
+                *lane = d.mul_add(p as f32, *lane);
+            }
+        }
+        let r = [acc[4] + acc[0], acc[5] + acc[1], acc[6] + acc[2], acc[7] + acc[3]];
+        (r[0] + r[2]) + (r[1] + r[3])
+    }
+}
+
+multiversion! {
+    /// One step of the causal depthwise convolution of every channel over `[state (kernel - 1 values), new value]`:
+    /// `out[c] = sum_i v_i * w[c][i]` (accumulated with fused multiply-adds, plus the bias if there is one), then the
+    /// state of the channel moves on by one value. `state` holds `kernel - 1` values per channel.
+    fn causal_conv_step(
+        state: &mut [f32],
+        weights: &[f32],
+        kernel: usize,
+        input: &[f32],
+        bias: Option<&[f32]>,
+        out: &mut [f32],
+    ) {
+        let km1 = kernel - 1;
+        for c in 0..input.len() {
+            let st = &mut state[c * km1..(c + 1) * km1];
+            let w = &weights[c * kernel..(c + 1) * kernel];
+            let mut sum = 0.0f32;
+            for (i, &wi) in w.iter().enumerate() {
+                let v = if i < km1 { st[i] } else { input[c] };
+                sum = v.mul_add(wi, sum);
+            }
+            out[c] = match bias {
+                Some(b) => sum + b[c],
+                None => sum,
+            };
+            st.copy_within(1.., 0);
+            st[km1 - 1] = input[c];
         }
     }
-    let r = [acc[4] + acc[0], acc[5] + acc[1], acc[6] + acc[2], acc[7] + acc[3]];
-    (r[0] + r[2]) + (r[1] + r[3])
+}
+
+multiversion! {
+    /// `state[j][e] = fma(k[e], delta[j], state[j][e])` for the `hd` rows `j` of a transposed recurrent state.
+    fn rank_one_update(state: &mut [f32], k: &[f32], delta: &[f32], hd: usize) {
+        for j in 0..hd {
+            let dj = delta[j];
+            for (e, &ki) in state[j * hd..(j + 1) * hd].iter_mut().zip(k) {
+                *e = ki.mul_add(dj, *e);
+            }
+        }
+    }
 }
 
 /// A projection `rows x cols` with an optional Hadamard input transform.
@@ -374,6 +421,15 @@ impl Proj {
         }
     }
 
+    /// Worker threads the projection runs on (1 for the kinds that run on the calling thread).
+    pub fn threads(&self) -> usize {
+        match &self.weights {
+            Weights::Ternary(l) => l.num_threads(),
+            Weights::Q8 { threads, .. } => *threads,
+            _ => 1,
+        }
+    }
+
     fn set_num_threads(&mut self, threads: usize) {
         match &mut self.weights {
             Weights::Ternary(l) => l.set_num_threads(threads),
@@ -463,19 +519,7 @@ impl GatedDeltaNet {
         // Causal depthwise convolution over [state (kernel - 1 values), new value] per channel; the state keeps the
         // last kernel - 1 inputs.
         let (conv_state, ssm_state) = kv.recurrent_state_mut(self.rec_index);
-        let km1 = self.kernel - 1;
-        for c in 0..ch {
-            let st = &mut conv_state[c * km1..(c + 1) * km1];
-            let w = &self.conv_w[c * self.kernel..(c + 1) * self.kernel];
-            let mut sum = 0.0f32;
-            for (i, &wi) in w.iter().enumerate() {
-                let v = if i < km1 { st[i] } else { s.a[c] };
-                sum = v.mul_add(wi, sum);
-            }
-            s.c[c] = sum;
-            st.copy_within(1.., 0);
-            st[km1 - 1] = s.a[c];
-        }
+        causal_conv_step(conv_state, &self.conv_w, self.kernel, &s.a[..ch], None, &mut s.c[..ch]);
         silu(&s.c[..ch].to_vec(), &mut s.c[..ch]);
 
         // L2 norm of every query and key head: rms_norm(x, eps / n) * (1 / sqrt(n)).
@@ -511,12 +555,7 @@ impl GatedDeltaNet {
                 let sum = ggml_vec_dot_f32(&st[j * hd..(j + 1) * hd], k);
                 s.delta[j] = (v[j] - sum) * beta[h];
             }
-            for j in 0..hd {
-                let dj = s.delta[j];
-                for (e, &ki) in st[j * hd..(j + 1) * hd].iter_mut().zip(k) {
-                    *e = ki.mul_add(dj, *e);
-                }
-            }
+            rank_one_update(st, k, &s.delta[..hd], hd);
             for j in 0..hd {
                 s.d[h * hd + j] = ggml_vec_dot_f32(&st[j * hd..(j + 1) * hd], q) * scale;
             }
@@ -582,36 +621,16 @@ impl GatedAttention {
 
         s.k16.resize(nkv * hd, 0);
         s.v16.resize(nkv * hd, 0);
-        for i in 0..nkv * hd {
-            s.k16[i] = f32_to_f16(s.b[i]);
-            s.v16[i] = f32_to_f16(s.c[i]);
-        }
+        f32_to_f16_slice(&s.b[..nkv * hd], &mut s.k16[..nkv * hd]);
+        f32_to_f16_slice(&s.c[..nkv * hd], &mut s.v16[..nkv * hd]);
         kv.append(self.attn_index, pos, &s.k16, &s.v16);
 
-        s.q16.resize(hd, 0);
-        s.vkq16.resize(hd, 0);
-        s.acc.resize(hd, 0.0);
+        s.q16.resize(nq * hd, 0);
+        s.vkq16.resize(nq * hd, 0);
+        s.acc.resize(nq * hd, 0.0);
         s.att.resize(nq * hd, 0.0);
-        let scale = 1.0 / (hd as f32).sqrt();
-        for h in 0..nq {
-            let q = &s.d[h * hd..(h + 1) * hd];
-            for (d, &v) in q.iter().enumerate() {
-                s.q16[d] = f32_to_f16(v);
-            }
-            attend_head(
-                &s.q16,
-                q,
-                kv,
-                self.attn_index,
-                h / (nq / nkv),
-                pos + 1,
-                scale,
-                &mut s.vkq16,
-                &mut s.acc,
-                &mut s.att[h * hd..(h + 1) * hd],
-                true,
-            );
-        }
+        let layout = HeadsLayout { head_dim: hd, gqa_ratio: nq / nkv, f32_values: true, layer: self.attn_index, seq_len: pos + 1, scale: 1.0 / (hd as f32).sqrt() };
+        attend_heads(&layout, &s.d[..nq * hd], &mut s.q16, &mut s.vkq16, &mut s.acc, kv, &mut s.att, self.q.threads());
         for (a, &g) in s.att.iter_mut().zip(&s.e) {
             *a *= sigmoid_f32(g);
         }
@@ -697,20 +716,7 @@ impl Mamba2 {
         self.in_proj.forward(x, &mut s.a[..n_in], &mut s.proj);
 
         let (conv_state, ssm_state) = kv.recurrent_state_mut(self.rec_index);
-        let km1 = self.kernel - 1;
-        for c in 0..ch {
-            let input = s.a[di + c];
-            let st = &mut conv_state[c * km1..(c + 1) * km1];
-            let w = &self.conv_w[c * self.kernel..(c + 1) * self.kernel];
-            let mut sum = 0.0f32;
-            for (i, &wi) in w.iter().enumerate() {
-                let v = if i < km1 { st[i] } else { input };
-                sum = v.mul_add(wi, sum);
-            }
-            s.c[c] = sum + self.conv_b[c];
-            st.copy_within(1.., 0);
-            st[km1 - 1] = input;
-        }
+        causal_conv_step(conv_state, &self.conv_w, self.kernel, &s.a[di..di + ch], Some(&self.conv_b), &mut s.c[..ch]);
         silu(&s.c[..ch].to_vec(), &mut s.c[..ch]);
 
         let (xs, rest) = s.c.split_at(di);
@@ -771,24 +777,15 @@ impl PlainAttention {
         self.v.forward(x, &mut s.c[..nkv * hd], &mut s.proj);
         s.k16.resize(nkv * hd, 0);
         s.v16.resize(nkv * hd, 0);
-        for i in 0..nkv * hd {
-            s.k16[i] = f32_to_f16(s.b[i]);
-            s.v16[i] = f32_to_f16(s.c[i]);
-        }
+        f32_to_f16_slice(&s.b[..nkv * hd], &mut s.k16[..nkv * hd]);
+        f32_to_f16_slice(&s.c[..nkv * hd], &mut s.v16[..nkv * hd]);
         kv.append(self.attn_index, pos, &s.k16, &s.v16);
-        s.q16.resize(hd, 0);
-        s.vkq16.resize(hd, 0);
-        s.acc.resize(hd, 0.0);
+        s.q16.resize(nq * hd, 0);
+        s.vkq16.resize(nq * hd, 0);
+        s.acc.resize(nq * hd, 0.0);
         s.att.resize(nq * hd, 0.0);
-        let scale = 1.0 / (hd as f32).sqrt();
-        for h in 0..nq {
-            let q = &s.d[h * hd..(h + 1) * hd];
-            for (d, &v) in q.iter().enumerate() {
-                s.q16[d] = f32_to_f16(v);
-            }
-            attend_head(&s.q16, q, kv, self.attn_index, h / (nq / nkv), pos + 1, scale, &mut s.vkq16, &mut s.acc,
-                &mut s.att[h * hd..(h + 1) * hd], true);
-        }
+        let layout = HeadsLayout { head_dim: hd, gqa_ratio: nq / nkv, f32_values: true, layer: self.attn_index, seq_len: pos + 1, scale: 1.0 / (hd as f32).sqrt() };
+        attend_heads(&layout, &s.d[..nq * hd], &mut s.q16, &mut s.vkq16, &mut s.acc, kv, &mut s.att, self.q.threads());
         let att = std::mem::take(&mut s.att);
         self.o.forward(&att, out, &mut s.proj);
         s.att = att;
@@ -1240,7 +1237,7 @@ fn context_len(config: &ModelConfig) -> usize {
 pub const MAX_HYBRID_CONTEXT: usize = 32768;
 
 /// Per-layer integer metadata that is either one value or an array with one value per layer.
-fn per_layer(g: &GgufFile, key: &str, layers: usize) -> Result<Vec<usize>, String> {
+pub(crate) fn per_layer(g: &GgufFile, key: &str, layers: usize) -> Result<Vec<usize>, String> {
     match g.metadata.get(key) {
         Some(GgufMetadataValue::Array(a)) if a.len() == layers => {
             a.iter().map(|v| v.as_usize().ok_or_else(|| format!("metadata '{key}' has a non-integer entry"))).collect()
@@ -1346,4 +1343,115 @@ pub fn load_nemotron_h_moe(g: &GgufFile, config: &ModelConfig, threads: usize) -
     let embedding = ld.table("token_embd.weight", config.vocab_size, h)?;
     let kv = KVCache::try_new_hybrid(attn_layers, context_len(config), n_kv_attn.max(1), hd, &recurrent_lens)?;
     Ok((HybridModel { layers, embedding, embedding_inverse: None, output, attn_layers, recurrent_lens }, kv))
+}
+
+/// The token embedding of a Qwen3.5 model on the host, for the GPU decoder: a row of the (block-scaled) table dequantized, and, when the table is stored in the
+/// Hadamard latent space, transformed back. This is [`HybridModel::embed`] without the layers.
+pub struct HostEmbedding {
+    table: Proj,
+    inverse: Option<Hadamard>,
+}
+
+impl HostEmbedding {
+    /// Writes the embedding of `token` into `x` (`hidden_size` values).
+    pub fn embed(&self, token: usize, x: &mut [f32]) {
+        self.table.dequantize_row(token, x);
+        if let Some(inv) = &self.inverse {
+            inv.apply_inverse(x);
+        }
+    }
+}
+
+/// Loads the embedding table of a Qwen3.5 (`qwen35`) model for [`HostEmbedding`].
+pub fn load_qwen35_embedding(g: &GgufFile, config: &ModelConfig, threads: usize) -> Result<HostEmbedding, String> {
+    let hadamard = HadamardSpec::from_gguf(g)?;
+    let h = config.hidden_size;
+    let inverse = match &hadamard {
+        Some(spec) if spec.inverse.contains_key("token_embd.weight") => Some(spec.transform_for(h)?),
+        _ => None,
+    };
+    let ld = Loader { g, threads, hadamard, hidden: h };
+    Ok(HostEmbedding { table: ld.table("token_embd.weight", config.vocab_size, h)?, inverse })
+}
+
+/// Loads the embedding table of a Nemotron-H (`nemotron_h_moe`) model for [`HostEmbedding`].
+pub fn load_nemotron_embedding(g: &GgufFile, config: &ModelConfig, threads: usize) -> Result<HostEmbedding, String> {
+    let h = config.hidden_size;
+    let ld = Loader { g, threads, hadamard: None, hidden: h };
+    Ok(HostEmbedding { table: ld.table("token_embd.weight", config.vocab_size, h)?, inverse: None })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rnd(seed: &mut u64) -> f32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        ((*seed % 2_000_001) as f32 - 1_000_000.0) * 1e-6
+    }
+
+    /// `causal_conv_step` and `rank_one_update` against a plain model of their definition (with `mul_add` written out
+    /// in test code), in both versions of the `multiversion!` functions.
+    fn run_checks() {
+        let mut seed = 0x5EED_C0DE_1234_5678u64;
+        let (channels, kernel) = (37usize, 4usize);
+        let km1 = kernel - 1;
+        let weights: Vec<f32> = (0..channels * kernel).map(|_| rnd(&mut seed)).collect();
+        let input: Vec<f32> = (0..channels).map(|_| rnd(&mut seed)).collect();
+        let bias: Vec<f32> = (0..channels).map(|_| rnd(&mut seed)).collect();
+        for with_bias in [false, true] {
+            let state0: Vec<f32> = (0..channels * km1).map(|_| rnd(&mut seed)).collect();
+            let (mut state, mut out) = (state0.clone(), vec![0.0f32; channels]);
+            causal_conv_step(&mut state, &weights, kernel, &input, with_bias.then_some(&bias[..]), &mut out);
+            for c in 0..channels {
+                let mut sum = 0.0f32;
+                for i in 0..kernel {
+                    let v = if i < km1 { state0[c * km1 + i] } else { input[c] };
+                    sum = v.mul_add(weights[c * kernel + i], sum);
+                }
+                let want = if with_bias { sum + bias[c] } else { sum };
+                assert_eq!(out[c].to_bits(), want.to_bits(), "channel {c}");
+                let mut moved: Vec<f32> = state0[c * km1 + 1..(c + 1) * km1].to_vec();
+                moved.push(input[c]);
+                assert_eq!(&state[c * km1..(c + 1) * km1], &moved[..], "state of channel {c}");
+            }
+        }
+
+        let hd = 19usize;
+        let k: Vec<f32> = (0..hd).map(|_| rnd(&mut seed)).collect();
+        let delta: Vec<f32> = (0..hd).map(|_| rnd(&mut seed)).collect();
+        let state0: Vec<f32> = (0..hd * hd).map(|_| rnd(&mut seed)).collect();
+        let mut state = state0.clone();
+        rank_one_update(&mut state, &k, &delta, hd);
+        for j in 0..hd {
+            for e in 0..hd {
+                let want = k[e].mul_add(delta[j], state0[j * hd + e]);
+                assert_eq!(state[j * hd + e].to_bits(), want.to_bits(), "row {j} element {e}");
+            }
+        }
+
+        let w: Vec<i8> = (0..96).map(|_| (rnd(&mut seed) * 120.0) as i8).collect();
+        let a: Vec<i8> = (0..96).map(|_| (rnd(&mut seed) * 120.0) as i8).collect();
+        let (wd, ad) = ([0.5f32, 0.25, 0.125], [0.75f32, 1.5, 0.3]);
+        let mut acc = [0.0f32; 8];
+        for b in 0..3 {
+            let d = wd[b] * ad[b];
+            for j in 0..8 {
+                let p: i32 = (4 * j..4 * j + 4).map(|k| w[32 * b + k] as i32 * a[32 * b + k] as i32).sum();
+                acc[j] = d.mul_add(p as f32, acc[j]);
+            }
+        }
+        let r = [acc[4] + acc[0], acc[5] + acc[1], acc[6] + acc[2], acc[7] + acc[3]];
+        let want = (r[0] + r[2]) + (r[1] + r[3]);
+        assert_eq!(dot_q8_0_scalar(&w, &wd, &a, &ad).to_bits(), want.to_bits());
+    }
+
+    #[test]
+    fn recurrent_layer_helpers_follow_their_definition_in_every_version() {
+        run_checks();
+        #[cfg(target_arch = "x86_64")]
+        crate::dispatch::with_baseline(run_checks);
+    }
 }

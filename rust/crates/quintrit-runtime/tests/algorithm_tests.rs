@@ -5,7 +5,7 @@
 
 use quintrit_format::decoders::i2_s::pack_gguf_i2_s;
 use quintrit_runtime::attention::AttentionBlock;
-use quintrit_runtime::config::{ActivationType, ModelArchitecture, ModelConfig};
+use quintrit_runtime::config::{ActivationType, ModelArchitecture, ModelConfig, Numerics};
 use quintrit_runtime::engine::{find_safe_flush_index, format_chat_prompt, ChatMessage};
 use quintrit_runtime::kv_cache::KVCache;
 use quintrit_runtime::layer::{
@@ -684,7 +684,10 @@ fn tiny_model(threads: usize) -> QuintritModel {
 }
 
 fn tiny_model_with(kind: TernaryKernelType, threads: usize) -> QuintritModel {
-    let cfg = tiny_config();
+    tiny_model_cfg(kind, threads, tiny_config())
+}
+
+fn tiny_model_cfg(kind: TernaryKernelType, threads: usize, cfg: ModelConfig) -> QuintritModel {
     let (h, i, qd, kvd) = (cfg.hidden_size, cfg.intermediate_size, cfg.num_attention_heads * cfg.head_dim, cfg.num_key_value_heads * cfg.head_dim);
     let mut rng = Rng::new(21);
     let norm = |rng: &mut Rng, n: usize| rng.floats(n, 0.2).iter().map(|v| v + 1.0).collect::<Vec<f32>>();
@@ -768,6 +771,112 @@ fn decoder_stack_is_deterministic_thread_independent_and_input_sensitive() {
     let other = run_sequence(&single, &[tokens[0], 11]);
     assert_eq!(other[0], reference[0], "the first position depends only on the first token");
     assert_ne!(other[1], reference[1]);
+}
+
+#[test]
+fn prefill_without_logits_leaves_the_same_cache_and_next_logits() {
+    let model = tiny_model(1);
+    let cfg = &model.config;
+    let tokens = [3u32, 17, 42, 5, 9, 21];
+    let full = run_sequence(&model, &tokens);
+
+    // Every token but the last skips the final norm and the vocabulary projection.
+    let mut cache = KVCache::new(cfg.num_hidden_layers, 32, cfg.num_key_value_heads, cfg.head_dim);
+    let mut scratch = InferenceScratchpad::new(cfg, 32);
+    let (last, head) = tokens.split_last().unwrap();
+    for (pos, &t) in head.iter().enumerate() {
+        model.prefill_token_with_scratchpad(t, pos, &mut cache, &mut scratch);
+    }
+    let mut logits = vec![0.0f32; cfg.vocab_size];
+    model.forward_token_with_scratchpad(*last, head.len(), &mut cache, &mut scratch, &mut logits);
+    assert_eq!(logits, *full.last().unwrap(), "the logits of the last token must not depend on the skipped heads");
+
+    // The cache holds exactly the positions of the full pass.
+    let mut reference = KVCache::new(cfg.num_hidden_layers, 32, cfg.num_key_value_heads, cfg.head_dim);
+    let mut ref_scratch = InferenceScratchpad::new(cfg, 32);
+    let mut ref_logits = vec![0.0f32; cfg.vocab_size];
+    for (pos, &t) in tokens.iter().enumerate() {
+        model.forward_token_with_scratchpad(t, pos, &mut reference, &mut ref_scratch, &mut ref_logits);
+    }
+    assert_eq!(cache.len(), reference.len());
+    for layer in 0..cfg.num_hidden_layers {
+        for pos in 0..tokens.len() {
+            for h in 0..cfg.num_key_value_heads {
+                assert_eq!(cache.get_key(layer, pos, h), reference.get_key(layer, pos, h));
+                assert_eq!(cache.get_val(layer, pos, h), reference.get_val(layer, pos, h));
+            }
+        }
+    }
+}
+
+/// Logits of a long run on a cache that holds `positions` positions, token by token.
+fn run_long(model: &QuintritModel, positions: usize) -> Vec<Vec<f32>> {
+    let cfg = &model.config;
+    let mut cache = KVCache::new(cfg.num_hidden_layers, positions, cfg.num_key_value_heads, cfg.head_dim);
+    let mut scratch = InferenceScratchpad::new(cfg, positions);
+    let mut all = Vec::new();
+    for pos in 0..positions {
+        let token = ((pos * 7 + 3) % cfg.vocab_size) as u32;
+        let mut logits = vec![0.0f32; cfg.vocab_size];
+        model.forward_token_with_scratchpad(token, pos, &mut cache, &mut scratch, &mut logits);
+        // Only every 16th position and the last ones are kept: the whole run is compared through them.
+        if pos % 16 == 0 || pos + 3 >= positions {
+            all.push(logits);
+        }
+    }
+    all
+}
+
+#[test]
+fn parallel_attention_over_heads_is_bit_identical_to_serial() {
+    use quintrit_runtime::attention::{KV_PADDING, PARALLEL_ATTENTION_MIN_WORK, SPLIT_KV_MIN_LEN};
+    // Long enough to pass the parallel threshold and the padded length at which the reference splits the KV axis.
+    let positions = SPLIT_KV_MIN_LEN + KV_PADDING + 5;
+    // Past the work threshold of the four-head test model, so that the parallel path really runs.
+    let positions = positions.max(PARALLEL_ATTENTION_MIN_WORK / 4 + 1);
+    for numerics in [Numerics::BitnetCpp, Numerics::LlamaCpp] {
+        let mut cfg = tiny_config();
+        cfg.numerics = numerics;
+        cfg.max_position_embeddings = positions;
+        let serial = run_long(&tiny_model_cfg(TernaryKernelType::QuintritLut, 1, cfg.clone()), positions);
+        assert!(serial.iter().flatten().all(|v| v.is_finite()));
+        for threads in [2, 3, 4] {
+            let parallel = run_long(&tiny_model_cfg(TernaryKernelType::QuintritLut, threads, cfg.clone()), positions);
+            assert_eq!(parallel, serial, "{numerics:?}: {threads} threads must not change a bit");
+        }
+    }
+}
+
+/// The shared head loop of the dense and the hybrid decoders: serial and parallel give the same bits for layouts with grouped and ungrouped heads, both
+/// value numerics and positions around the padding and split borders of the KV axis.
+#[test]
+fn attend_heads_parallel_equals_serial_for_every_layout() {
+    use quintrit_runtime::attention::{attend_heads_with, HeadsLayout, KV_PADDING, SPLIT_KV_MIN_LEN};
+    let max_len = SPLIT_KV_MIN_LEN + 2 * KV_PADDING;
+    for (nq, nkv, hd) in [(8usize, 2usize, 64usize), (6, 6, 32), (5, 1, 128), (1, 1, 64)] {
+        let mut rng = Rng::new(1000 + (nq * 100 + hd) as u64);
+        let mut cache = KVCache::new(1, max_len, nkv, hd);
+        for pos in 0..max_len {
+            let k: Vec<u16> = rng.floats(nkv * hd, 1.0).iter().map(|&v| f32_to_f16(v)).collect();
+            let v: Vec<u16> = rng.floats(nkv * hd, 1.0).iter().map(|&v| f32_to_f16(v)).collect();
+            cache.append(0, pos, &k, &v);
+        }
+        let q = rng.floats(nq * hd, 2.0);
+        for f32_values in [false, true] {
+            for seq_len in [1, 31, 32, 33, 255, 256, 257, 511, 512, 513, 700, max_len] {
+                let layout = HeadsLayout { head_dim: hd, gqa_ratio: nq / nkv, f32_values, layer: 0, seq_len, scale: 1.0 / (hd as f32).sqrt() };
+                let run = |threads: usize, parallel: bool| {
+                    let (mut q16, mut vkq, mut acc, mut out) = (vec![0u16; nq * hd], vec![0u16; nq * hd], vec![0f32; nq * hd], vec![0f32; nq * hd]);
+                    attend_heads_with(&layout, &q, &mut q16, &mut vkq, &mut acc, &cache, &mut out, threads, parallel);
+                    out.iter().map(|v| v.to_bits()).collect::<Vec<u32>>()
+                };
+                let serial = run(1, false);
+                for threads in [2, 3, 8] {
+                    assert_eq!(run(threads, true), serial, "{nq}/{nkv}x{hd}, f32_values {f32_values}, seq_len {seq_len}, {threads} threads");
+                }
+            }
+        }
+    }
 }
 
 #[test]

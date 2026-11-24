@@ -504,7 +504,7 @@ fn main() {
                     rep.generation_ms / 1000.0,
                     latency_ms,
                     tokens_per_sec,
-                    rep.memory_bandwidth_gb_s,
+                    rep.memory_bandwidth_gb_s.expect("a dense CPU model reports its weight traffic"),
                     gflops
                 );
 
@@ -519,8 +519,8 @@ fn main() {
                     gen_total_ms: rep.generation_ms,
                     latency_ms,
                     tokens_per_sec,
-                    weight_mb: rep.dram_traffic_per_token_mb,
-                    bandwidth_gbps: rep.memory_bandwidth_gb_s,
+                    weight_mb: rep.dram_traffic_per_token_mb.expect("a dense CPU model reports its weight traffic"),
+                    bandwidth_gbps: rep.memory_bandwidth_gb_s.expect("a dense CPU model reports its weight traffic"),
                     gflops,
                 });
 

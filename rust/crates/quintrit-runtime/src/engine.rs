@@ -131,10 +131,13 @@ pub struct BenchmarkReport {
     pub generation_ms: f64,
     /// Generation throughput in tokens per second.
     pub tokens_per_sec: f64,
-    /// Effective memory bandwidth utilization in GB/s.
-    pub memory_bandwidth_gb_s: f64,
-    /// Total DRAM weight traffic per token in MB (ternary projections plus the F16 `lm_head`).
-    pub dram_traffic_per_token_mb: f64,
+    /// Effective memory bandwidth utilization in GB/s; `None` where the weight traffic per token is not known (see
+    /// [`BenchmarkReport::dram_traffic_per_token_mb`]).
+    pub memory_bandwidth_gb_s: Option<f64>,
+    /// Total DRAM weight traffic per token in MB (ternary projections plus the F16 `lm_head`). `None` for a model on the
+    /// GPU and for the hybrid models (Gated DeltaNet, Mamba-2, mixture of experts), whose weights are not all read for
+    /// every token or are not kept in the CPU layers this sum covers.
+    pub dram_traffic_per_token_mb: Option<f64>,
     /// Active kernel architecture used.
     pub kernel_type: TernaryKernelType,
     /// Text generated during the benchmark pass.
@@ -167,6 +170,9 @@ pub struct InferenceEngine {
     /// The weights on the GPU (shared by the sessions of a host that manages its own, such as the C API).
     #[cfg(feature = "cuda")]
     gpu_model: Option<std::sync::Arc<crate::gpu::GpuModel>>,
+    /// The token embedding of a hybrid model on the GPU, kept on the host (a row per token is dequantized and sent to the device).
+    #[cfg(feature = "cuda")]
+    gpu_embedding: Option<crate::hybrid::HostEmbedding>,
 }
 
 /// Token counts and timings of one [`InferenceEngine::generate_streaming_with_stops`] call.
@@ -263,8 +269,18 @@ impl InferenceEngine {
         }
         let hidden = self.model.config.hidden_size;
         let token = (((context - 1) * 7919 + 13) % vocab) as usize;
-        let row = self.model.token_embeddings[token * hidden..(token + 1) * hidden].to_vec();
         let gpu = self.gpu.as_mut().expect("checked above");
+        if let Some(emb) = &self.gpu_embedding {
+            let mut row = vec![0f32; hidden];
+            emb.embed(token, &mut row);
+            return gpu.time_token_f32(&row, context - 1, blocks, iterations);
+        }
+        if let Some(crate::layer::LinearLayer::BlockScaled(emb)) = &self.model.embedding_layer {
+            let mut row = vec![0f32; hidden];
+            emb.dequantize_row(token, &mut row);
+            return gpu.time_token_f32(&row, context - 1, blocks, iterations);
+        }
+        let row = self.model.token_embeddings[token * hidden..(token + 1) * hidden].to_vec();
         gpu.time_token(&row, context - 1, blocks, iterations)
     }
 
@@ -287,13 +303,69 @@ impl InferenceEngine {
         #[cfg(feature = "cuda")]
         if let Some(gpu) = self.gpu.as_mut() {
             let hidden = self.model.config.hidden_size;
-            let off = token_id as usize * hidden;
-            gpu.forward(&self.model.token_embeddings[off..off + hidden], pos, logits)?;
+            if let Some(emb) = &self.gpu_embedding {
+                if token_id as usize >= self.model.config.vocab_size {
+                    return Err(format!("token {token_id} is outside the vocabulary"));
+                }
+                emb.embed(token_id as usize, &mut self.scratchpad.x[..hidden]);
+                gpu.forward_f32(&self.scratchpad.x[..hidden], pos, logits)?;
+            } else if let Some(crate::layer::LinearLayer::BlockScaled(emb)) = &self.model.embedding_layer {
+                if token_id as usize >= self.model.config.vocab_size {
+                    return Err(format!("token {token_id} is outside the vocabulary"));
+                }
+                emb.dequantize_row(token_id as usize, &mut self.scratchpad.x[..hidden]);
+                gpu.forward_f32(&self.scratchpad.x[..hidden], pos, logits)?;
+            } else {
+                let off = token_id as usize * hidden;
+                gpu.forward(&self.model.token_embeddings[off..off + hidden], pos, logits)?;
+            }
             self.kv_cache.mark_position(pos);
             return Ok(());
         }
         self.model.forward_token_with_scratchpad(token_id, pos, &mut self.kv_cache, &mut self.scratchpad, logits);
         Ok(())
+    }
+
+    /// Advances the cache by one prompt position whose logits nobody reads (every prompt token except the last one).
+    ///
+    /// The final norm and the vocabulary projection are skipped (on the GPU a second CUDA graph without them runs), which leaves the cache
+    /// bit-identical to the one [`InferenceEngine::forward_token`] writes.
+    pub fn prefill_token(&mut self, token_id: u32, pos: usize) -> Result<(), String> {
+        if token_id as usize >= self.model.config.vocab_size {
+            return Err(format!("token {token_id} is outside the vocabulary"));
+        }
+        #[cfg(feature = "cuda")]
+        if self.gpu.is_none() && self.gpu_model.is_some() {
+            return Err("the model was loaded onto the GPU without a session; create a session from `gpu_model()`".to_string());
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(gpu) = self.gpu.as_mut() {
+            let hidden = self.model.config.hidden_size;
+            if let Some(emb) = &self.gpu_embedding {
+                emb.embed(token_id as usize, &mut self.scratchpad.x[..hidden]);
+                gpu.prefill_f32(&self.scratchpad.x[..hidden], pos)?;
+            } else if let Some(crate::layer::LinearLayer::BlockScaled(emb)) = &self.model.embedding_layer {
+                emb.dequantize_row(token_id as usize, &mut self.scratchpad.x[..hidden]);
+                gpu.prefill_f32(&self.scratchpad.x[..hidden], pos)?;
+            } else {
+                let off = token_id as usize * hidden;
+                gpu.prefill(&self.model.token_embeddings[off..off + hidden], pos)?;
+            }
+            self.kv_cache.mark_position(pos);
+            return Ok(());
+        }
+        self.model.prefill_token_with_scratchpad(token_id, pos, &mut self.kv_cache, &mut self.scratchpad);
+        Ok(())
+    }
+
+    /// Ingests `tokens` at the positions `first_pos..` and leaves the logits of the last one in `logits`. Only the last token pays for the
+    /// vocabulary projection. `tokens` must not be empty.
+    fn ingest_prompt(&mut self, tokens: &[u32], first_pos: usize, logits: &mut [f32]) -> Result<(), String> {
+        let (last, head) = tokens.split_last().ok_or_else(|| "the prompt has no tokens".to_string())?;
+        for (i, &token_id) in head.iter().enumerate() {
+            self.prefill_token(token_id, first_pos + i)?;
+        }
+        self.forward_token(*last, first_pos + head.len(), logits)
     }
 
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
@@ -309,6 +381,8 @@ impl InferenceEngine {
         let mut gpu: Option<crate::gpu::GpuDecoder> = None;
         #[cfg(feature = "cuda")]
         let mut gpu_model: Option<std::sync::Arc<crate::gpu::GpuModel>> = None;
+        #[cfg(feature = "cuda")]
+        let mut gpu_embedding: Option<crate::hybrid::HostEmbedding> = None;
 
         // 1. Detect architecture & hyperparameters from GGUF metadata, and reject a damaged or foreign file (absurd
         //    hyper-parameters, missing or wrongly sized tensors) before anything is indexed or allocated.
@@ -374,12 +448,26 @@ impl InferenceEngine {
                 progress!("==> Loading the model onto the GPU...");
                 let weights = std::sync::Arc::new(crate::gpu::GpuModel::load(gguf, &config, ordinal, limit)?);
                 progress!("    [{:.2?}] weights on {}", t0.elapsed(), weights.device_name());
-                let token_embeddings = gguf
-                    .get_tensor_f16("token_embd.weight")
-                    .ok_or_else(|| "Missing token_embd.weight tensor".to_string())?
-                    .to_vec();
+                // A block-scaled embedding stays on the host and is dequantized row by row, as the CPU path does; an F16 one is kept as it is.
+                let hybrid_gpu = matches!(config.architecture, ModelArchitecture::Qwen35 | ModelArchitecture::NemotronHMoe);
+                let (token_embeddings, embedding_layer) = if hybrid_gpu {
+                    gpu_embedding = Some(if config.architecture == ModelArchitecture::Qwen35 {
+                        crate::hybrid::load_qwen35_embedding(gguf, &config, num_threads)?
+                    } else {
+                        crate::hybrid::load_nemotron_embedding(gguf, &config, num_threads)?
+                    });
+                    (Vec::new(), None)
+                } else if gguf.tensors.get("token_embd.weight").map(|t| t.tensor_type) == Some(quintrit_format::GGML_TYPE_Q2_0) {
+                    let layer = load_projection(gguf, "token_embd.weight", config.vocab_size, config.hidden_size, target_kernel, num_threads)?;
+                    (Vec::new(), Some(layer))
+                } else {
+                    let table = gguf.get_tensor_f16("token_embd.weight").ok_or_else(|| "Missing token_embd.weight tensor".to_string())?.to_vec();
+                    (table, None)
+                };
                 let output_norm = gguf.get_tensor_f32("output_norm.weight").ok_or_else(|| "Missing output_norm.weight tensor".to_string())?;
-                let kv = KVCache::try_new(1, weights.max_context(), 1, 2)?;
+                // The cache of the engine is a placeholder (the keys and values live on the device); a hybrid model has a recurrent state, which a placeholder entry
+                // announces so that a prompt is reused only when it continues the cached sequence.
+                let kv = if hybrid_gpu { KVCache::try_new_hybrid(1, weights.max_context(), 1, 2, &[(1, 1)])? } else { KVCache::try_new(1, weights.max_context(), 1, 2)? };
                 let model = QuintritModel {
                     config: config.clone(),
                     token_embeddings,
@@ -387,7 +475,7 @@ impl InferenceEngine {
                     output_norm,
                     lm_head: None,
                     lm_head_f16: None,
-                    embedding_layer: None,
+                    embedding_layer,
                     hybrid: None,
                 };
                 if with_session {
@@ -567,6 +655,8 @@ impl InferenceEngine {
             gpu,
             #[cfg(feature = "cuda")]
             gpu_model,
+            #[cfg(feature = "cuda")]
+            gpu_embedding,
         })
     }
 
@@ -625,10 +715,8 @@ impl InferenceEngine {
         // 1. Ingest the prompt tokens that are not in the KV cache yet
         let t_prompt = Instant::now();
         let reused = self.reusable_prefix(&prompt_tokens);
-        for (pos, &token_id) in prompt_tokens.iter().enumerate().skip(reused) {
-            self.forward_token(token_id, pos, &mut logits)?;
-            self.cached_tokens.push(token_id);
-        }
+        self.ingest_prompt(&prompt_tokens[reused..], reused, &mut logits)?;
+        self.cached_tokens.extend_from_slice(&prompt_tokens[reused..]);
         let prompt_ms = t_prompt.elapsed().as_secs_f64() * 1000.0;
         let t_generation = Instant::now();
         let mut generated_tokens = 0usize;
@@ -785,9 +873,7 @@ impl InferenceEngine {
 
         // 1. Measure Time to First Token (TTFT)
         let t_prompt_start = Instant::now();
-        for (pos, &token_id) in prompt_tokens.iter().enumerate() {
-            self.forward_token(token_id, pos, &mut logits)?;
-        }
+        self.ingest_prompt(&prompt_tokens, 0, &mut logits)?;
         let ttft = t_prompt_start.elapsed();
 
         // 2. Measure subsequent token generation throughput
@@ -845,8 +931,9 @@ impl InferenceEngine {
 
         // The F16 vocabulary projection (`lm_head`) is read in full for every token as well.
         total_weight_bytes += self.model.lm_head_f16.as_ref().unwrap_or(&self.model.token_embeddings).len() * std::mem::size_of::<u16>();
-        let dram_mb_per_token = (total_weight_bytes as f64) / (1024.0 * 1024.0);
-        let bandwidth_gb_s = (dram_mb_per_token * tokens_per_sec) / 1024.0;
+        let traffic_known = self.gpu_device_name().is_none() && self.model.hybrid.is_none();
+        let dram_mb_per_token = traffic_known.then(|| (total_weight_bytes as f64) / (1024.0 * 1024.0));
+        let bandwidth_gb_s = dram_mb_per_token.map(|mb| (mb * tokens_per_sec) / 1024.0);
         let generated_text = self.tokenizer.decode(&generated_ids);
 
         Ok(BenchmarkReport {

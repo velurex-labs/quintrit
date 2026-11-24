@@ -2,6 +2,8 @@
 
 This page compares the quintrit kernels with the kernels of Microsoft BitNet on the same machines (first part) and
 gives the memory-bandwidth ceiling of every machine, which explains where each encoding wins (second part).
+The decode speed of whole models on CPUs and GPUs is reported separately, one page per model, in
+[`model_benchmarks/`](../model_benchmarks/README.md).
 
 ## Kernel comparison: quintrit versus BitNet
 
@@ -290,6 +292,12 @@ cargo run --release -p quintrit-runtime --features cuda --example gpu_decode_ben
 
 `QUINTRIT_GPU=<index>` selects the GPU and `QUINTRIT_GPU_CONTEXT=<tokens>` bounds the context window. Run it on an
 otherwise idle GPU.
+
+## Decoding whole models
+
+The kernel comparison above measures the weight-streaming pattern of one model. The speed of complete models, measured end to end with the `quintrit` command-line tool
+(`quintrit --bench`: prompt, attention, output head and sampling included), is in [`model_benchmarks/`](../model_benchmarks/README.md). It covers 17 ternary models on four CPUs (AVX2, AVX-512 and NEON) and two
+NVIDIA GPUs. Every model has its own page with the thread scaling, the long-prompt figures, the measurement conditions and the command to reproduce the numbers.
 
 ## Running the benchmarks
 

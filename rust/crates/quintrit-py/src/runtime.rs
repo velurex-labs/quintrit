@@ -195,8 +195,15 @@ impl GenState {
         })
     }
 
-    fn forward(&mut self, eng: &mut InferenceEngine, token: u32, pos: usize) -> Result<(), Fail> {
-        let result = guard("forward pass", || eng.forward_token(token, pos, &mut self.logits))?;
+    /// One forward pass; a prompt token that is not the last one (`need_logits` false) skips the vocabulary projection on the CPU.
+    fn forward(&mut self, eng: &mut InferenceEngine, token: u32, pos: usize, need_logits: bool) -> Result<(), Fail> {
+        let result = guard("forward pass", || {
+            if need_logits {
+                eng.forward_token(token, pos, &mut self.logits)
+            } else {
+                eng.prefill_token(token, pos)
+            }
+        })?;
         result.map_err(|m| QError::new(Kind::Device, m))?;
         Ok(())
     }
@@ -215,7 +222,7 @@ impl GenState {
             eng.kv_cache.reset();
             let prompt = std::mem::take(&mut self.prompt);
             for (pos, &id) in prompt.iter().enumerate() {
-                self.forward(eng, id, pos)?;
+                self.forward(eng, id, pos, pos + 1 == prompt.len())?;
                 Python::attach(|py| py.check_signals())?;
             }
             self.pos = prompt.len();
@@ -281,7 +288,7 @@ impl GenState {
                     self.finish = Some(Finish::Context);
                 } else {
                     let pos = self.pos;
-                    self.forward(eng, token, pos)?;
+                    self.forward(eng, token, pos, true)?;
                     self.pos += 1;
                     Python::attach(|py| py.check_signals())?;
                 }
@@ -818,10 +825,11 @@ impl PyModel {
                 eng.kv_cache.reset();
                 let mut logits = vec![0.0f32; vocab];
                 let result = guard("forward pass", || -> Result<(), String> {
-                    for (pos, &id) in ids.iter().enumerate() {
-                        eng.forward_token(id, pos, &mut logits)?;
+                    let (last, head) = ids.split_last().expect("checked above that the prompt has tokens");
+                    for (pos, &id) in head.iter().enumerate() {
+                        eng.prefill_token(id, pos)?;
                     }
-                    Ok(())
+                    eng.forward_token(*last, head.len(), &mut logits)
                 })?;
                 result.map_err(|m| QError::new(Kind::Device, m))?;
                 Ok(logits)

@@ -75,8 +75,8 @@ let text = engine.generate_streaming("What is ternary computing?", 64, &Sampling
 ```
 
 The weights are transcoded into the GPU layout while the file is read, the KV cache lives on the device, and every token is one
-replayed CUDA graph. Results are bit-identical to the CPU path. `I2_S` models are supported (head dimensions 32, 64, 128 and 256,
-contexts up to 7936 tokens); block-scaled `Q2_0`, mixture-of-experts and hybrid models run on the CPU only and the GPU loader says so.
+replayed CUDA graph. Results are bit-identical to the CPU path. `I2_S` models and block-scaled `Q2_0` models (dense, hybrid Qwen3.5 and the mixture-of-experts model Nemotron-H) are supported (head
+dimensions 32, 64, 128 and 256, contexts up to 7936 tokens); a model the GPU path cannot run is refused with an error that says why.
 `quintrit_runtime::gpu::GpuModel` holds the weights and makes independent sessions (`GpuModel::new_session`), each with its own KV
 cache. The example `examples/gpu_decode_bench.rs` measures the device time of a token. See
 [the GPU guide](../../../docs/guides/gpu.md).

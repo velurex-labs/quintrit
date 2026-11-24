@@ -108,3 +108,19 @@ and for extreme activations including `-128`.
 - NVIDIA GPU (optional): compute capability 8.0 or newer, CUDA Toolkit 13.x to build.
 
 `quintrit.cpu_features()` in Python and `quintrit_cpu_features()` in C report what was detected.
+
+## Compiler flags
+
+No compiler flags are needed. Every code path that depends on the instruction set is compiled for it explicitly and
+chosen by CPU detection when the program runs: the kernels and also the plain code around them (attention,
+normalization, activations, half-precision conversions, the recurrent layers of hybrid models). A build without
+`RUSTFLAGS` gives the same results as a build with `-C target-cpu=native` and runs the same instructions on the hot
+paths.
+
+What a build for one CPU model still gains is the compiler's own tuning of the kernels (instruction scheduling,
+unrolling, inlining across function boundaries). It is worth a few percent. Decoding with the same models and thread
+count, a default build reaches about 97 % of the speed of a build with `-C target-cpu=x86-64-v3` on an Intel Core
+i7-7700 (AVX2), 90 to 95 % of a build with `-C target-cpu=znver4` on an AMD EPYC 9V45 (AVX-512) and 100 to 104 % of a build with
+`-C target-cpu=neoverse-n2` on an Arm Neoverse-N2. For the last few percent build with `-C target-cpu=native`, or with `x86-64-v3` (AVX2) or `x86-64-v4`
+(AVX-512) for a binary that runs on other machines of the same class; such a binary needs that instruction set on every
+machine it runs on, a default build does not.

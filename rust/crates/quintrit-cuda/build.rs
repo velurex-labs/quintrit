@@ -91,6 +91,10 @@ fn main() {
                 let out = out_dir.join(format!("{name}.fatbin"));
                 let mut cmd = Command::new(nvcc);
                 cmd.arg("-std=c++17").arg("-O3").arg("-fatbin").arg("-I").arg(&kernels_dir);
+                if name == "q2" {
+                    // The kernels of block-scaled models are bit-exact against the CPU: no contraction of a product and a sum into a fused multiply-add.
+                    cmd.arg("-fmad=false");
+                }
                 if let Ok(extra) = env::var("QUINTRIT_CUDA_NVCC_FLAGS") {
                     cmd.args(extra.split_whitespace());
                 }

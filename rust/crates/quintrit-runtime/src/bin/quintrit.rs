@@ -40,13 +40,27 @@ OPTIONS:
                             - cuda[:N]:  NVIDIA GPU N (default 0; compute capability 8.0 or newer; build with
                                          `--features cuda`). Results are bit-identical to the CPU path.
     --context <N>           Context window in tokens on the GPU (default 4096, at most 7936)
-    --bench                 Run benchmark pass (measures TTFT, tokens/sec, memory bandwidth)
+    --bench                 Run benchmark pass (greedy; measures TTFT and tokens/sec, on the CPU also the
+                            weight traffic of dense models)
+    --prompt-file <PATH>    Read the prompt from a text file instead of --prompt
+    --chat-template         Wrap the prompt as one user message in the chat template of the model
+    --warmup <N>            Benchmark runs that are executed and discarded first (default 0)
+    --repeat <N>            Measured benchmark runs (default 1)
+    --json                  After the benchmark print one line `QUINTRIT_BENCH_JSON {{...}}` with all runs and the
+                            run conditions
     --chat                  Enter interactive multi-turn chat session
     --stop <TEXT>           Additional stop sequence to halt generation (can be repeated)
     -h, --help              Print this help information
 "#,
         program = program
     );
+}
+
+/// Peak resident set size of this process in KiB (Linux only; `None` elsewhere).
+fn peak_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 fn main() {
@@ -78,6 +92,11 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(4);
     let mut run_bench = false;
+    let mut bench_warmup: usize = 0;
+    let mut bench_repeat: usize = 1;
+    let mut bench_json = false;
+    let mut chat_template = false;
+    let mut prompt_file: Option<PathBuf> = None;
     let mut run_chat = false;
     let mut custom_stops: Vec<String> = Vec::new();
 
@@ -172,6 +191,30 @@ fn main() {
             "--bench" => {
                 run_bench = true;
             }
+            "--json" => {
+                bench_json = true;
+            }
+            "--chat-template" => {
+                chat_template = true;
+            }
+            "--prompt-file" => {
+                i += 1;
+                if i < args.len() {
+                    prompt_file = Some(PathBuf::from(&args[i]));
+                }
+            }
+            "--warmup" => {
+                i += 1;
+                if i < args.len() {
+                    bench_warmup = args[i].parse().unwrap_or(0);
+                }
+            }
+            "--repeat" => {
+                i += 1;
+                if i < args.len() {
+                    bench_repeat = args[i].parse().unwrap_or(1).max(1);
+                }
+            }
             "--chat" => {
                 run_chat = true;
             }
@@ -250,15 +293,45 @@ fn main() {
         seed: 42,
     };
 
-    if run_bench {
-        println!("\n==> Running Performance Benchmark Pass (Tokens: {})...", max_tokens);
-        let report = match engine.benchmark(&prompt, max_tokens) {
-            Ok(report) => report,
+    if let Some(path) = &prompt_file {
+        prompt = match std::fs::read_to_string(path) {
+            Ok(text) => text.trim_end_matches(['\r', '\n']).to_string(),
             Err(e) => {
-                eprintln!("Error: {e}");
+                eprintln!("Cannot read the prompt file {}: {e}", path.display());
                 exit(1);
             }
         };
+    }
+    if chat_template {
+        let message = ChatMessage { role: "user".to_string(), content: prompt.clone(), name: None };
+        prompt = format_chat_prompt(&[message], engine.model.config.architecture);
+    }
+
+    if run_bench {
+        println!("\n==> Running Performance Benchmark Pass (Tokens: {}, warm-up runs: {}, measured runs: {})...", max_tokens, bench_warmup, bench_repeat);
+        let mut reports = Vec::with_capacity(bench_repeat);
+        for run in 0..bench_warmup + bench_repeat {
+            let report = match engine.benchmark(&prompt, max_tokens) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    exit(1);
+                }
+            };
+            let tag = if run < bench_warmup { "warm-up" } else { "measured" };
+            println!(
+                "  [{tag} {}] TTFT {:.2} ms, {} tokens in {:.2} ms, {:.2} tokens/sec",
+                if run < bench_warmup { run + 1 } else { run + 1 - bench_warmup },
+                report.ttft_ms,
+                report.generated_tokens,
+                report.generation_ms,
+                report.tokens_per_sec
+            );
+            if run >= bench_warmup {
+                reports.push(report);
+            }
+        }
+        let report = reports.last().expect("at least one measured run");
 
         println!("\n===============================================================================");
         println!("  Inference Benchmark Results ({:?} Kernel)", report.kernel_type);
@@ -268,9 +341,58 @@ fn main() {
         println!("  Time to First Token (TTFT):  {:.2} ms", report.ttft_ms);
         println!("  Generation Latency:          {:.2} ms", report.generation_ms);
         println!("  Generation Throughput:       {:.2} tokens/sec", report.tokens_per_sec);
-        println!("  DRAM Weight Traffic/Token:   {:.2} MB", report.dram_traffic_per_token_mb);
-        println!("  DRAM Memory Bandwidth:       {:.2} GB/s", report.memory_bandwidth_gb_s);
+        match (report.dram_traffic_per_token_mb, report.memory_bandwidth_gb_s) {
+            (Some(traffic), Some(bandwidth)) => {
+                println!("  DRAM Weight Traffic/Token:   {:.2} MB", traffic);
+                println!("  DRAM Memory Bandwidth:       {:.2} GB/s", bandwidth);
+            }
+            _ => println!("  Weight traffic:              not reported for this model or device"),
+        }
         println!("===============================================================================");
+
+        if bench_json {
+            let mut rates: Vec<f64> = reports.iter().map(|r| r.tokens_per_sec).collect();
+            rates.sort_by(|a, b| a.total_cmp(b));
+            let median = if rates.len() % 2 == 1 {
+                rates[rates.len() / 2]
+            } else {
+                (rates[rates.len() / 2 - 1] + rates[rates.len() / 2]) / 2.0
+            };
+            let runs: Vec<serde_json::Value> = reports
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "ttft_ms": r.ttft_ms,
+                        "generation_ms": r.generation_ms,
+                        "generated_tokens": r.generated_tokens,
+                        "tokens_per_sec": r.tokens_per_sec,
+                    })
+                })
+                .collect();
+            let gpu_name = engine.gpu_device_name();
+            let json = serde_json::json!({
+                "model_file": model_path.file_name().map(|n| n.to_string_lossy().to_string()),
+                "model_bytes": std::fs::metadata(&model_path).map(|m| m.len()).ok(),
+                "architecture": format!("{:?}", engine.model.config.architecture),
+                "device": gpu_name.clone().unwrap_or_else(|| "cpu".to_string()),
+                "kernel": if gpu_name.is_some() { "gpu".to_string() } else { format!("{:?}", report.kernel_type) },
+                "threads": if gpu_name.is_some() { serde_json::Value::Null } else { serde_json::json!(num_threads) },
+                "context": engine.kv_cache.max_seq_len(),
+                "chat_template": chat_template,
+                "prompt_tokens": report.prompt_tokens,
+                "requested_tokens": max_tokens,
+                "warmup_runs": bench_warmup,
+                "runs": runs,
+                "tokens_per_sec_median": median,
+                "tokens_per_sec_min": rates.first(),
+                "tokens_per_sec_max": rates.last(),
+                "dram_traffic_per_token_mb": report.dram_traffic_per_token_mb,
+                "memory_bandwidth_gb_s": report.memory_bandwidth_gb_s,
+                "peak_rss_kib": peak_rss_kib(),
+                "generated_text": report.generated_text,
+            });
+            println!("QUINTRIT_BENCH_JSON {json}");
+        }
     } else if run_chat {
         println!("\n==> Entering Interactive Multi-Turn Chat Session");
         println!("    Model Architecture: {:?}", engine.model.config.architecture);

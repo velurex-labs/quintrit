@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 460" role="img" aria-label="Ternary Bonsai 1.7B: scaling with the number of threads: tokens per second against the number of threads">
+<style>svg{font-family:system-ui,-apple-system,'Segoe UI',sans-serif}:root{--bg:#fcfcfb;--t1:#0b0b0b;--t2:#52514e;--grid:#e3e2de;--axis:#9a998f;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;}@media (prefers-color-scheme:dark){:root{--bg:#1a1a19;--t1:#f0efec;--t2:#c3c2b7;--grid:#34332f;--axis:#6b6a63;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;}}.bg{fill:var(--bg)}.t1{fill:var(--t1)}.t2{fill:var(--t2)}.grid{stroke:var(--grid);stroke-width:1}.axis{stroke:var(--axis);stroke-width:1}.ring{stroke:var(--bg);stroke-width:2}.l1{stroke:var(--s1);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m1{fill:var(--s1)}.l2{stroke:var(--s2);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m2{fill:var(--s2)}.l3{stroke:var(--s3);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m3{fill:var(--s3)}.l4{stroke:var(--s4);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}.m4{fill:var(--s4)}</style>
+<rect class="bg" width="800" height="460"/>
+<text class="t1" x="80" y="30" font-size="17" font-weight="600">Ternary Bonsai 1.7B: scaling with the number of threads</text>
+<text class="t2" x="80" y="50" font-size="12">Decode speed in generated tokens per second, standard prompt, 256 greedy tokens, median of 3 runs (5 at the highest thread count)</text>
+<rect class="m1" x="80" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="95" y="75" font-size="12">EPYC 9V45 (AVX-512)</text>
+<rect class="m2" x="242.39999999999998" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="257.4" y="75" font-size="12">Neoverse-N2 (NEON)</text>
+<rect class="m3" x="398.2" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="413.2" y="75" font-size="12">i7-7700 (AVX2)</text>
+<rect class="m4" x="527.5999999999999" y="66" width="10" height="10" rx="2"/>
+<text class="t2" x="542.5999999999999" y="75" font-size="12">Raspberry Pi 5 (NEON)</text>
+<line class="grid" x1="80" x2="600" y1="390.0" y2="390.0"/>
+<text class="t2" x="70" y="394.0" font-size="12" text-anchor="end">0</text>
+<line class="grid" x1="80" x2="600" y1="315.5" y2="315.5"/>
+<text class="t2" x="70" y="319.5" font-size="12" text-anchor="end">20</text>
+<line class="grid" x1="80" x2="600" y1="241.0" y2="241.0"/>
+<text class="t2" x="70" y="245.0" font-size="12" text-anchor="end">40</text>
+<line class="grid" x1="80" x2="600" y1="166.5" y2="166.5"/>
+<text class="t2" x="70" y="170.5" font-size="12" text-anchor="end">60</text>
+<line class="grid" x1="80" x2="600" y1="92.0" y2="92.0"/>
+<text class="t2" x="70" y="96.0" font-size="12" text-anchor="end">80</text>
+<line class="axis" x1="80" x2="600" y1="390.0" y2="390.0"/>
+<text class="t2" x="100.0" y="410.0" font-size="12" text-anchor="middle">1</text>
+<text class="t2" x="260.0" y="410.0" font-size="12" text-anchor="middle">2</text>
+<text class="t2" x="420.0" y="410.0" font-size="12" text-anchor="middle">4</text>
+<text class="t2" x="580.0" y="410.0" font-size="12" text-anchor="middle">8</text>
+<text class="t2" x="340.0" y="436" font-size="12" text-anchor="middle">threads</text>
+<text class="t2" x="18" y="241.0" font-size="12" text-anchor="middle" transform="rotate(-90 18 241.0)">tokens per second</text>
+<path class="l1" d="M100.0,223.1 L260.0,153.2 L420.0,136.5"/>
+<circle class="m1 ring" cx="100.0" cy="223.1" r="5"><title>EPYC 9V45 (AVX-512), 1 thread: 44.79 tokens/s (min 43.95, max 44.93)</title></circle>
+<circle class="m1 ring" cx="260.0" cy="153.2" r="5"><title>EPYC 9V45 (AVX-512), 2 threads: 63.58 tokens/s (min 63.25, max 64.48)</title></circle>
+<circle class="m1 ring" cx="420.0" cy="136.5" r="5"><title>EPYC 9V45 (AVX-512), 4 threads: 68.04 tokens/s (min 66.63, max 68.62)</title></circle>
+<path class="l2" d="M100.0,362.3 L260.0,338.5 L420.0,297.2 L580.0,244.0"/>
+<circle class="m2 ring" cx="100.0" cy="362.3" r="5"><title>Neoverse-N2 (NEON), 1 thread: 7.43 tokens/s (min 7.41, max 7.46)</title></circle>
+<circle class="m2 ring" cx="260.0" cy="338.5" r="5"><title>Neoverse-N2 (NEON), 2 threads: 13.84 tokens/s (min 13.82, max 13.87)</title></circle>
+<circle class="m2 ring" cx="420.0" cy="297.2" r="5"><title>Neoverse-N2 (NEON), 4 threads: 24.92 tokens/s (min 24.89, max 25.00)</title></circle>
+<circle class="m2 ring" cx="580.0" cy="244.0" r="5"><title>Neoverse-N2 (NEON), 8 threads: 39.18 tokens/s (min 38.84, max 39.67)</title></circle>
+<path class="l3" d="M100.0,369.2 L260.0,352.0 L420.0,324.7 L580.0,316.8"/>
+<circle class="m3 ring" cx="100.0" cy="369.2" r="5"><title>i7-7700 (AVX2), 1 thread: 5.59 tokens/s (min 5.58, max 5.59)</title></circle>
+<circle class="m3 ring" cx="260.0" cy="352.0" r="5"><title>i7-7700 (AVX2), 2 threads: 10.19 tokens/s (min 10.00, max 10.21)</title></circle>
+<circle class="m3 ring" cx="420.0" cy="324.7" r="5"><title>i7-7700 (AVX2), 4 threads: 17.53 tokens/s (min 17.51, max 17.56)</title></circle>
+<circle class="m3 ring" cx="580.0" cy="316.8" r="5"><title>i7-7700 (AVX2), 8 threads: 19.66 tokens/s (min 19.59, max 19.71)</title></circle>
+<path class="l4" d="M100.0,372.1 L260.0,355.6 L420.0,333.8"/>
+<circle class="m4 ring" cx="100.0" cy="372.1" r="5"><title>Raspberry Pi 5 (NEON), 1 thread: 4.82 tokens/s (min 4.82, max 4.83)</title></circle>
+<circle class="m4 ring" cx="260.0" cy="355.6" r="5"><title>Raspberry Pi 5 (NEON), 2 threads: 9.24 tokens/s (min 9.24, max 9.25)</title></circle>
+<circle class="m4 ring" cx="420.0" cy="333.8" r="5"><title>Raspberry Pi 5 (NEON), 4 threads: 15.08 tokens/s (min 15.05, max 15.13)</title></circle>
+<text class="t1" x="432.0" y="140.5" font-size="12">68.04</text>
+<text class="t1" x="592.0" y="248.0" font-size="12">39.18</text>
+<text class="t1" x="592.0" y="320.8" font-size="12">19.66</text>
+<text class="t1" x="432.0" y="337.8" font-size="12">15.08</text>
+</svg>

@@ -24,10 +24,12 @@ pub struct InferenceScratchpad {
     pub v: Vec<f32>,
     pub k_f16: Vec<u16>,
     pub v_f16: Vec<u16>,
+    /// The query of every head rounded to FP16 (`q_dim` values, one `head_dim` lane per query head).
     pub q_slice_f16: Vec<u16>,
     pub scores: Vec<f32>,
+    /// FP16 value accumulator of every query head's attention (`q_dim` values, one `head_dim` lane per head).
     pub head_out_f16: Vec<u16>,
-    /// F32 accumulator of the split-KV attention reduction (`head_dim`).
+    /// F32 accumulator of the split-KV attention reduction (`q_dim` values, one `head_dim` lane per query head; the per-head norms use the first lane).
     pub head_acc: Vec<f32>,
     /// `Q8_0` codes of the input of a block-scaled projection (the widest input).
     pub q8_qs: Vec<i8>,
@@ -92,10 +94,10 @@ impl InferenceScratchpad {
             v: vec![0.0f32; kv_dim],
             k_f16: vec![0u16; kv_dim],
             v_f16: vec![0u16; kv_dim],
-            q_slice_f16: vec![0u16; head_dim],
+            q_slice_f16: vec![0u16; q_dim],
             scores: vec![0.0f32; effective_max_seq],
-            head_out_f16: vec![0u16; head_dim],
-            head_acc: vec![0.0f32; head_dim],
+            head_out_f16: vec![0u16; q_dim],
+            head_acc: vec![0.0f32; q_dim],
             q8_qs: vec![0i8; max_cols.max(q_dim)],
             q8_d: vec![0.0f32; max_cols.max(q_dim).div_ceil(32)],
             attn_sub_buf: vec![0.0f32; q_dim],

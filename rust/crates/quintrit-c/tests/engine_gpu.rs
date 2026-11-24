@@ -47,6 +47,39 @@ fn gpu_logits_equal_cpu_logits_position_by_position() {
     assert!(gpu.forward_token(1, 48, &mut lg).is_err());
 }
 
+/// Prompt tokens other than the last one run without the final norm and the vocabulary projection (a second CUDA graph on the GPU): the cache they
+/// leave must be the one of the full pass, so the logits of the last token and of the tokens that follow stay bit-identical.
+#[test]
+fn prefill_without_the_head_leaves_the_cache_of_the_full_pass() {
+    let dir = TempDir::new("engine-gpu-prefill");
+    let path = dir.path("model.gguf");
+    write_model(&path, 21, &Flaws::default());
+    let Some(mut gpu) = gpu_engine(&path) else { return };
+    let mut cpu = InferenceEngine::load_from_gguf(&path, 1, None).unwrap();
+    let tokens: Vec<u32> = (0..40).map(|i| ((i * 37 + 11) % 256) as u32).collect();
+    let bits = |l: &[f32]| l.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+
+    // Reference: the full pass on the CPU.
+    let mut want = vec![0f32; VOCAB];
+    for (pos, &t) in tokens.iter().enumerate() {
+        cpu.forward_token(t, pos, &mut want).unwrap();
+    }
+    let mut next_want = vec![0f32; VOCAB];
+    cpu.forward_token(7, tokens.len(), &mut next_want).unwrap();
+
+    for (name, engine) in [("CPU", &mut cpu), ("GPU", &mut gpu)] {
+        let mut got = vec![0f32; VOCAB];
+        let (last, head) = tokens.split_last().unwrap();
+        for (pos, &t) in head.iter().enumerate() {
+            engine.prefill_token(t, pos).unwrap();
+        }
+        engine.forward_token(*last, head.len(), &mut got).unwrap();
+        assert_eq!(bits(&got), bits(&want), "{name}: logits of the last prompt token");
+        engine.forward_token(7, tokens.len(), &mut got).unwrap();
+        assert_eq!(bits(&got), bits(&next_want), "{name}: logits of the token after the prompt");
+    }
+}
+
 /// The whole decoder over a long context. The attended key-value axis is split into four chunks from 512 padded positions on (the first position that
 /// attends more than 256 positions is position 256), which the context-48 model above never reaches. The model declares a context of 1280 positions,
 /// a multiple of 256, so the CPU cache (the model's full length) and the GPU window give the same padded axis at every position, and 1100 positions

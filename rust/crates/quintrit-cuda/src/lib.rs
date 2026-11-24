@@ -29,9 +29,12 @@ pub mod device;
 pub mod driver;
 pub mod error;
 pub mod gemv;
+pub mod hybrid;
 pub mod kernels;
 pub mod layer;
+pub mod nemotron;
 pub mod pack;
+pub mod q2;
 pub mod profile;
 
 pub use device::{
@@ -40,6 +43,9 @@ pub use device::{
 };
 pub use error::{Error, Result};
 pub use gemv::{Activation, Gemv, RopeLayout};
+pub use nemotron::{BlockScaledExperts, MambaLayout, NemotronKernels, Q8Matrix};
+pub use hybrid::{DeltaNetLayout, HybridKernels, ValueHeadPermutation, MAX_HADAMARD_BLOCK};
+pub use q2::{BlockScaledKernels, BlockScaledMatrix};
 pub use layer::{AttentionLayout, AttentionWorkspace, LayerKernels, RopeKvLayout, RopeMode};
 pub use profile::{DeviceProfile, GemvConfig, Role};
 

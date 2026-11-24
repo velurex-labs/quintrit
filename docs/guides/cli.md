@@ -14,6 +14,9 @@ cargo build --release -p quintrit-runtime --bin quintrit
 
 Or run it through cargo: `cargo run --release -p quintrit-runtime --bin quintrit -- <options>`.
 
+No compiler flags are needed: the instruction set is chosen when the program runs. `-C target-cpu=native` adds a few
+percent, see [Compiler flags](../kernels.md#compiler-flags).
+
 ## Options
 
 | Option | Meaning |
@@ -29,12 +32,16 @@ Or run it through cargo: `cargo run --release -p quintrit-runtime --bin quintrit
 | `--device <DEVICE>` | `cpu` (default), `cuda` or `cuda:<index>`: run the model on an NVIDIA GPU (build with `--features cuda`, see [`gpu.md`](gpu.md)). The text is the same as on the CPU. |
 | `--context <N>` | Context window in tokens on a GPU (default 4096, at most 7936). |
 | `--chat` | Interactive multi-turn chat. Each turn re-sends the conversation in the chat template of the model; the KV cache of the previous turn is kept, so only the new part is computed. `/reset` forgets the conversation. |
-| `--bench` | Measure time to first token, tokens per second and memory bandwidth. |
+| `--bench` | Greedy benchmark pass: time to first token and tokens per second; on the CPU, for dense models, also the weight traffic and memory bandwidth. Generates exactly `--max-tokens` tokens (it does not stop at the end-of-sequence token). |
+| `--prompt-file <PATH>` | Read the prompt from a text file instead of `--prompt`. |
+| `--chat-template` | Wrap the prompt as one user message in the chat template of the model. |
+| `--warmup <N>`, `--repeat <N>` | With `--bench`: runs that are executed and discarded first (default 0), and measured runs (default 1). |
+| `--json` | With `--bench`: print one more line, `QUINTRIT_BENCH_JSON {...}`, with every run, the median, minimum and maximum, the device, kernel, thread count and context. |
 | `-h`, `--help` | Show the help text. |
 
 ## Models
 
-Any GGUF model with ternary weights (`I2_S`, `TQ1_0` or `TQ2_0`; `I2_S` models also on a GPU) of the BitNet b1.58, Falcon3 or LLaMA families. The weights are
+Any GGUF model with ternary weights (`I2_S`, `TQ1_0` or `TQ2_0`; `I2_S` and block-scaled `Q2_0` models also on a GPU) of the BitNet b1.58, Falcon3 or LLaMA families. The weights are
 transcoded into RAM at start-up, which takes from seconds to minutes depending on the size of the model. Models are not part
 of this repository; take them from their publishers and read their licenses.
 

@@ -119,6 +119,7 @@ pub struct LayerKernels {
     lm_head: Function,
     rope_kv: Function,
     attention: [Function; 4],
+    attention_f32: [Function; 4],
     shared_limit: usize,
 }
 
@@ -149,6 +150,12 @@ impl LayerKernels {
             lm_head: module.function("lm_head")?,
             rope_kv: module.function("rope_kv")?,
             attention: [with_shared("attention_h32")?, with_shared("attention_h64")?, with_shared("attention_h128")?, with_shared("attention_h256")?],
+            attention_f32: [
+                with_shared("attention_h32_f32")?,
+                with_shared("attention_h64_f32")?,
+                with_shared("attention_h128_f32")?,
+                with_shared("attention_h256_f32")?,
+            ],
             shared_limit,
         })
     }
@@ -344,6 +351,41 @@ impl LayerKernels {
         pos_dev: &DeviceBuffer<i32>,
         workspace: &AttentionWorkspace,
     ) -> Result<()> {
+        self.attention_with(&self.attention, stream, layout, scale, k_cache, v_cache, q, out, pos_dev, workspace)
+    }
+
+    /// [`LayerKernels::attention`] with the arithmetic of upstream llama.cpp, bit-identical to `attend_head` with `f32_values`: the query stays F32 (it is not
+    /// rounded to F16), the scores are `ggml_vec_dot_f16_f32` and the value accumulator is F32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_f32(
+        &self,
+        stream: &Stream,
+        layout: AttentionLayout,
+        scale: f32,
+        k_cache: &DeviceBuffer<u16>,
+        v_cache: &DeviceBuffer<u16>,
+        q: &DeviceBuffer<f32>,
+        out: &DeviceBuffer<f32>,
+        pos_dev: &DeviceBuffer<i32>,
+        workspace: &AttentionWorkspace,
+    ) -> Result<()> {
+        self.attention_with(&self.attention_f32, stream, layout, scale, k_cache, v_cache, q, out, pos_dev, workspace)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_with(
+        &self,
+        functions: &[Function; 4],
+        stream: &Stream,
+        layout: AttentionLayout,
+        scale: f32,
+        k_cache: &DeviceBuffer<u16>,
+        v_cache: &DeviceBuffer<u16>,
+        q: &DeviceBuffer<f32>,
+        out: &DeviceBuffer<f32>,
+        pos_dev: &DeviceBuffer<i32>,
+        workspace: &AttentionWorkspace,
+    ) -> Result<()> {
         let idx = match layout.head_dim {
             32 => 0,
             64 => 1,
@@ -376,6 +418,6 @@ impl LayerKernels {
         a.push((layout.q_heads / layout.kv_heads) as i32).push(layout.cache_len as i32).push(scale).buf(pos_dev);
         a.push(chunk_positions as i32);
         // SAFETY: the arguments match `attention_h<HD>`; the position read from `pos_dev` must be below `layout.max_len` (the caller's contract).
-        unsafe { self.attention[idx].launch(stream, (layout.q_heads as u32, ATTENTION_CHUNKS as u32, 1), (ATTENTION_THREADS, 1, 1), shared as u32, &a) }
+        unsafe { functions[idx].launch(stream, (layout.q_heads as u32, ATTENTION_CHUNKS as u32, 1), (ATTENTION_THREADS, 1, 1), shared as u32, &a) }
     }
 }

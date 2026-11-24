@@ -3,8 +3,9 @@
 use crate::config::{ModelConfig, Numerics, RopeConfig};
 use crate::kv_cache::KVCache;
 use crate::layer::LinearLayer;
+use crate::dispatch::multiversion;
 use crate::ops::{
-    apply_rope, f16_to_f32, f32_to_f16, ggml_vec_dot_f16, ggml_vec_dot_f16_f32, ggml_vec_mad_f16, ggml_vec_mad_f16_f32,
+    apply_rope, f32_to_f16_slice, ggml_vec_dot_f16, ggml_vec_dot_f16_f32, ggml_vec_mad_f16, ggml_vec_mad_f16_f32,
     ggml_vec_scale_f16, quantize_activations_int8_with_range, quantize_q8_0, rms_norm,
 };
 
@@ -196,39 +197,15 @@ impl AttentionBlock {
         );
 
         // 4. Append K and V into contiguous KV cache (FP16 precision)
-        for i in 0..kv_dim {
-            scratchpad.k_f16[i] = f32_to_f16(scratchpad.k[i]);
-            scratchpad.v_f16[i] = f32_to_f16(scratchpad.v[i]);
-        }
+        f32_to_f16_slice(&scratchpad.k[..kv_dim], &mut scratchpad.k_f16[..kv_dim]);
+        f32_to_f16_slice(&scratchpad.v[..kv_dim], &mut scratchpad.v_f16[..kv_dim]);
         kv_cache.append(layer_idx, pos, &scratchpad.k_f16[..kv_dim], &scratchpad.v_f16[..kv_dim]);
 
         // 5. Compute Grouped-Query Attention (GQA) matching BitNet ggml_flash_attn_ext
         let seq_len = pos + 1;
         let scale_factor = self.scale_factor;
 
-        for h in 0..self.num_q_heads {
-            let kv_h = h / self.gqa_ratio;
-            let q_slice = &scratchpad.q[h * self.head_dim..(h + 1) * self.head_dim];
-
-            for d in 0..self.head_dim {
-                scratchpad.q_slice_f16[d] = f32_to_f16(q_slice[d]);
-            }
-
-            let head_out = &mut scratchpad.attn_out[h * self.head_dim..(h + 1) * self.head_dim];
-            attend_head(
-                &scratchpad.q_slice_f16[..self.head_dim],
-                &scratchpad.q[h * self.head_dim..(h + 1) * self.head_dim],
-                kv_cache,
-                layer_idx,
-                kv_h,
-                seq_len,
-                scale_factor,
-                &mut scratchpad.head_out_f16[..self.head_dim],
-                &mut scratchpad.head_acc[..self.head_dim],
-                head_out,
-                self.f32_values,
-            );
-        }
+        self.attend_all_heads(layer_idx, seq_len, scale_factor, kv_cache, scratchpad);
 
         // 6. Sub-layer normalization (Sub-LN) if specified by architecture (e.g. BitNet)
         let o_act_scale = if let Some(sub_norm_weights) = &self.attn_sub_norm {
@@ -259,6 +236,22 @@ impl AttentionBlock {
         );
     }
 
+
+    /// Attention of every query head over the first `seq_len` cached positions; writes the heads side by side into `scratchpad.attn_out`
+    /// (see [`attend_heads`]).
+    fn attend_all_heads(&self, layer_idx: usize, seq_len: usize, scale: f32, kv_cache: &KVCache, scratchpad: &mut crate::scratchpad::InferenceScratchpad) {
+        let q_dim = self.num_q_heads * self.head_dim;
+        attend_heads(
+            &HeadsLayout { head_dim: self.head_dim, gqa_ratio: self.gqa_ratio, f32_values: self.f32_values, layer: layer_idx, seq_len, scale },
+            &scratchpad.q[..q_dim],
+            &mut scratchpad.q_slice_f16[..q_dim],
+            &mut scratchpad.head_out_f16[..q_dim],
+            &mut scratchpad.head_acc[..q_dim],
+            kv_cache,
+            &mut scratchpad.attn_out[..q_dim],
+            self.q_proj.num_threads(),
+        );
+    }
 
     /// Forward pass for block-scaled (`Q2_0`) projections: the inputs of the projections are quantized to `Q8_0`, as
     /// llama.cpp does before its `Q2_0 x Q8_0` dot products.
@@ -303,34 +296,12 @@ impl AttentionBlock {
             &self.rope,
         );
 
-        for i in 0..kv_dim {
-            scratchpad.k_f16[i] = f32_to_f16(scratchpad.k[i]);
-            scratchpad.v_f16[i] = f32_to_f16(scratchpad.v[i]);
-        }
+        f32_to_f16_slice(&scratchpad.k[..kv_dim], &mut scratchpad.k_f16[..kv_dim]);
+        f32_to_f16_slice(&scratchpad.v[..kv_dim], &mut scratchpad.v_f16[..kv_dim]);
         kv_cache.append(layer_idx, pos, &scratchpad.k_f16[..kv_dim], &scratchpad.v_f16[..kv_dim]);
 
         let seq_len = pos + 1;
-        for h in 0..self.num_q_heads {
-            let kv_h = h / self.gqa_ratio;
-            let q_slice = &scratchpad.q[h * self.head_dim..(h + 1) * self.head_dim];
-            for d in 0..self.head_dim {
-                scratchpad.q_slice_f16[d] = f32_to_f16(q_slice[d]);
-            }
-            let head_out = &mut scratchpad.attn_out[h * self.head_dim..(h + 1) * self.head_dim];
-            attend_head(
-                &scratchpad.q_slice_f16[..self.head_dim],
-                &scratchpad.q[h * self.head_dim..(h + 1) * self.head_dim],
-                kv_cache,
-                layer_idx,
-                kv_h,
-                seq_len,
-                self.scale_factor,
-                &mut scratchpad.head_out_f16[..self.head_dim],
-                &mut scratchpad.head_acc[..self.head_dim],
-                head_out,
-                self.f32_values,
-            );
-        }
+        self.attend_all_heads(layer_idx, seq_len, self.scale_factor, kv_cache, scratchpad);
 
         let o_in = if let Some(sub_norm) = &self.attn_sub_norm {
             rms_norm(&scratchpad.attn_out[..q_dim], sub_norm, self.rms_norm_eps, &mut scratchpad.attn_sub_buf[..q_dim]);
@@ -387,6 +358,100 @@ impl AttentionBlock {
     }
 }
 
+/// The attention heads of a token run on the worker pool once `heads x cached positions` reaches this value; below it the fork-join costs more than the
+/// serial loop. The serial loop is about eight times slower per position on the Neoverse-N2 than on the Zen 4 EPYC, while the fork costs about the same
+/// (15 to 20 us), so the break-even differs: measured with `benches/attention_threshold.rs` (both value numerics, 4 and 8 threads, 8 to 32 heads) it
+/// is at 8 to 24 positions of a 20-head layer on the N2 and at 100 to 200 on the EPYC. The values are set a little above the lower end of those ranges.
+#[cfg(target_arch = "aarch64")]
+pub const PARALLEL_ATTENTION_MIN_WORK: usize = 256;
+/// See the AArch64 value.
+#[cfg(not(target_arch = "aarch64"))]
+pub const PARALLEL_ATTENTION_MIN_WORK: usize = 2048;
+/// What [`attend_heads`] needs to know about the heads of one attention layer and the position.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadsLayout {
+    /// Values per head.
+    pub head_dim: usize,
+    /// Query heads per key/value head.
+    pub gqa_ratio: usize,
+    /// llama.cpp arithmetic (F32 value accumulator) instead of bitnet.cpp's (F16).
+    pub f32_values: bool,
+    /// Layer slot in the KV cache.
+    pub layer: usize,
+    /// Number of cached positions to attend to (the position of the token plus one).
+    pub seq_len: usize,
+    /// Score scale, `1 / sqrt(head_dim)` unless the model says otherwise.
+    pub scale: f32,
+}
+
+/// Attention of all query heads of one layer for the newest token: `q` holds the heads side by side (`n_heads * head_dim` values), `out` receives
+/// the heads in the same layout. `q16`, `vkq16` and `acc` are scratch lanes of the same length (one `head_dim` lane per head).
+///
+/// The heads are independent (each reads the shared KV cache and writes only its own lanes), so on a pool of more than one thread they run in
+/// parallel once `heads x positions` reaches [`PARALLEL_ATTENTION_MIN_WORK`]; the result does not depend on the thread count.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_heads(
+    layout: &HeadsLayout,
+    q: &[f32],
+    q16: &mut [u16],
+    vkq16: &mut [u16],
+    acc: &mut [f32],
+    kv_cache: &KVCache,
+    out: &mut [f32],
+    threads: usize,
+) {
+    let heads = q.len() / layout.head_dim;
+    let parallel = threads > 1 && heads > 1 && heads * layout.seq_len >= PARALLEL_ATTENTION_MIN_WORK;
+    attend_heads_with(layout, q, q16, vkq16, acc, kv_cache, out, threads, parallel);
+}
+
+/// [`attend_heads`] with the serial/parallel choice made by the caller (the benchmark that sets the threshold forces both).
+#[allow(clippy::too_many_arguments)]
+pub fn attend_heads_with(
+    layout: &HeadsLayout,
+    q: &[f32],
+    q16: &mut [u16],
+    vkq16: &mut [u16],
+    acc: &mut [f32],
+    kv_cache: &KVCache,
+    out: &mut [f32],
+    threads: usize,
+    parallel: bool,
+) {
+    use rayon::prelude::*;
+    let hd = layout.head_dim;
+    f32_to_f16_slice(q, q16);
+    let q16 = &*q16;
+    let one_head = |h: usize, vkq16: &mut [u16], acc: &mut [f32], out: &mut [f32]| {
+        attend_head(
+            &q16[h * hd..(h + 1) * hd],
+            &q[h * hd..(h + 1) * hd],
+            kv_cache,
+            layout.layer,
+            h / layout.gqa_ratio,
+            layout.seq_len,
+            layout.scale,
+            vkq16,
+            acc,
+            out,
+            layout.f32_values,
+        );
+    };
+    let vkq = vkq16.chunks_mut(hd);
+    let acc = acc.chunks_mut(hd);
+    let out = out.chunks_mut(hd);
+    if parallel {
+        let (vkq, acc, out): (Vec<_>, Vec<_>, Vec<_>) = (vkq.collect(), acc.collect(), out.collect());
+        quintrit_core::threading::get_thread_pool(threads).install(|| {
+            vkq.into_par_iter().zip(acc).zip(out).enumerate().for_each(|(h, ((vkq16, acc), out))| one_head(h, vkq16, acc, out));
+        });
+    } else {
+        for (h, ((vkq16, acc), out)) in vkq.zip(acc).zip(out).enumerate() {
+            one_head(h, vkq16, acc, out);
+        }
+    }
+}
+
 /// Number of worker threads of the reference runtime whose split-KV attention reduction [`attend_head`] reproduces
 /// (the parity references are captured with `-t 4`).
 pub const REFERENCE_ATTENTION_THREADS: usize = 4;
@@ -398,7 +463,9 @@ pub const SPLIT_KV_MIN_LEN: usize = 512;
 /// Online softmax over the cached positions `range` of one head with an FP32 value accumulator, identical to
 /// upstream llama.cpp's `ggml_compute_forward_flash_attn_ext_f16_one_chunk`: the scores are
 /// `ggml_vec_dot_f16_f32(K, Q)` with the query in F32, the values are accumulated with `ggml_vec_scale_f32` and
-/// `ggml_vec_mad_f16_f32`. Returns `(M, S)`; the accumulator is left in `vkq32`.
+/// `ggml_vec_mad_f16_f32`. Returns `(M, S)`; the accumulator is left in `vkq32`. Inlined into both versions of
+/// [`attend_head`].
+#[inline(always)]
 fn attend_range_f32(
     q_f32: &[f32],
     kv_cache: &KVCache,
@@ -434,7 +501,9 @@ fn attend_range_f32(
 }
 
 /// Online softmax over the cached positions `range` of one head with an FP16 value accumulator, identical to ggml's
-/// `ggml_compute_forward_flash_attn_ext_f16_one_chunk`. Returns `(M, S)`; the accumulator is left in `vkq16`.
+/// `ggml_compute_forward_flash_attn_ext_f16_one_chunk`. Returns `(M, S)`; the accumulator is left in `vkq16`. Inlined
+/// into both versions of [`attend_head`].
+#[inline(always)]
 fn attend_range(
     q_f16: &[u16],
     kv_cache: &KVCache,
@@ -468,80 +537,87 @@ fn attend_range(
     (max_score, s_sum)
 }
 
-/// Attention of one query head (already converted to FP16) over the first `seq_len` cached positions, written to
-/// `out` (`head_dim` values).
-///
-/// It reproduces the reference runtime's flash attention bit for bit, including the KV padding: while the padded KV
-/// length is below [`SPLIT_KV_MIN_LEN`] one online softmax runs over all positions; from there on the padded KV axis is
-/// split into [`REFERENCE_ATTENTION_THREADS`] equal chunks with separate FP16 accumulators whose partial results are
-/// combined in chunk order (`ggml_flash_attn_ext_reduce_partials`). The result does not depend on this runtime's own
-/// thread count.
-///
-/// `q_f16` is the query rounded to FP16 (bitnet.cpp converts it before the dot products), `q_f32` the query itself
-/// (llama.cpp keeps it in FP32); `f32_values` selects the llama.cpp arithmetic.
-#[allow(clippy::too_many_arguments)]
-pub fn attend_head(
-    q_f16: &[u16],
-    q_f32: &[f32],
-    kv_cache: &KVCache,
-    layer: usize,
-    kv_head: usize,
-    seq_len: usize,
-    scale: f32,
-    vkq16: &mut [u16],
-    acc: &mut [f32],
-    out: &mut [f32],
-    f32_values: bool,
-) {
-    let n_kv = kv_cache.max_seq_len().min(seq_len.next_multiple_of(KV_PADDING).max(KV_PADDING));
-    if f32_values {
-        attend_head_f32(q_f32, kv_cache, layer, kv_head, seq_len, scale, n_kv, acc, out);
-        return;
-    }
-    if n_kv < SPLIT_KV_MIN_LEN {
-        let (_, s_sum) = attend_range(q_f16, kv_cache, layer, kv_head, 0..seq_len, scale, vkq16);
-        let s_inv = if s_sum == 0.0 { 0.0 } else { 1.0 / s_sum };
-        for (o, &v) in out.iter_mut().zip(vkq16.iter()) {
-            *o = f16_to_f32(v) * s_inv;
+multiversion! {
+    /// Attention of one query head (already converted to FP16) over the first `seq_len` cached positions, written to
+    /// `out` (`head_dim` values).
+    ///
+    /// It reproduces the reference runtime's flash attention bit for bit, including the KV padding: while the padded KV
+    /// length is below [`SPLIT_KV_MIN_LEN`] one online softmax runs over all positions; from there on the padded KV axis
+    /// is split into [`REFERENCE_ATTENTION_THREADS`] equal chunks with separate FP16 accumulators whose partial results
+    /// are combined in chunk order (`ggml_flash_attn_ext_reduce_partials`). The result does not depend on this runtime's
+    /// own thread count.
+    ///
+    /// `q_f16` is the query rounded to FP16 (bitnet.cpp converts it before the dot products), `q_f32` the query itself
+    /// (llama.cpp keeps it in FP32); `f32_values` selects the llama.cpp arithmetic.
+    ///
+    /// The whole function is compiled twice (module `dispatch`): the scalar parts of the online softmax run with
+    /// fused multiply-adds on x86-64 CPUs that have them, whatever flags the crate was built with.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_head(
+        q_f16: &[u16],
+        q_f32: &[f32],
+        kv_cache: &KVCache,
+        layer: usize,
+        kv_head: usize,
+        seq_len: usize,
+        scale: f32,
+        vkq16: &mut [u16],
+        acc: &mut [f32],
+        out: &mut [f32],
+        f32_values: bool,
+    ) {
+        let n_kv = kv_cache.max_seq_len().min(seq_len.next_multiple_of(KV_PADDING).max(KV_PADDING));
+        if f32_values {
+            attend_head_f32(q_f32, kv_cache, layer, kv_head, seq_len, scale, n_kv, acc, out);
+            return;
         }
-        return;
-    }
+        if n_kv < SPLIT_KV_MIN_LEN {
+            let (_, s_sum) = attend_range(q_f16, kv_cache, layer, kv_head, 0..seq_len, scale, vkq16);
+            let s_inv = if s_sum == 0.0 { 0.0 } else { 1.0 / s_sum };
+            for (o, &v) in out.iter_mut().zip(vkq16.iter()) {
+                *o = H::to_f32(v) * s_inv;
+            }
+            return;
+        }
 
-    let chunk = n_kv.div_ceil(REFERENCE_ATTENTION_THREADS);
-    let mut m_final = f32::NEG_INFINITY;
-    let mut s_final = 0.0f32;
-    acc.fill(0.0);
-    for c in 0..REFERENCE_ATTENTION_THREADS {
-        let start = c * chunk;
-        let end = (start + chunk).min(n_kv).min(seq_len);
-        if start >= end {
-            continue; // a chunk of masked cells only: S = 0, skipped by the reduction
+        let chunk = n_kv.div_ceil(REFERENCE_ATTENTION_THREADS);
+        let mut m_final = f32::NEG_INFINITY;
+        let mut s_final = 0.0f32;
+        acc.fill(0.0);
+        for c in 0..REFERENCE_ATTENTION_THREADS {
+            let start = c * chunk;
+            let end = (start + chunk).min(n_kv).min(seq_len);
+            if start >= end {
+                continue; // a chunk of masked cells only: S = 0, skipped by the reduction
+            }
+            let (m_chunk, s_chunk) = attend_range(q_f16, kv_cache, layer, kv_head, start..end, scale, vkq16);
+            if s_chunk == 0.0 {
+                continue;
+            }
+            let m_new = m_final.max(m_chunk);
+            let scale_old = (m_final - m_new).exp();
+            let scale_new = (m_chunk - m_new).exp();
+            for (a, &v) in acc.iter_mut().zip(vkq16.iter()) {
+                // `VKQ_final*scale_old + VKQ_chunk*scale_new`, contracted into one FMA.
+                *a = a.mul_add(scale_old, H::to_f32(v) * scale_new);
+            }
+            s_final = s_final.mul_add(scale_old, s_chunk * scale_new);
+            m_final = m_new;
         }
-        let (m_chunk, s_chunk) = attend_range(q_f16, kv_cache, layer, kv_head, start..end, scale, vkq16);
-        if s_chunk == 0.0 {
-            continue;
+        if s_final != 0.0 {
+            let s_inv = 1.0 / s_final;
+            for (o, &a) in out.iter_mut().zip(acc.iter()) {
+                *o = a * s_inv;
+            }
+        } else {
+            out.copy_from_slice(acc);
         }
-        let m_new = m_final.max(m_chunk);
-        let scale_old = (m_final - m_new).exp();
-        let scale_new = (m_chunk - m_new).exp();
-        for (a, &v) in acc.iter_mut().zip(vkq16.iter()) {
-            // `VKQ_final*scale_old + VKQ_chunk*scale_new`, contracted into one FMA.
-            *a = a.mul_add(scale_old, f16_to_f32(v) * scale_new);
-        }
-        s_final = s_final.mul_add(scale_old, s_chunk * scale_new);
-        m_final = m_new;
-    }
-    if s_final != 0.0 {
-        let s_inv = 1.0 / s_final;
-        for (o, &a) in out.iter_mut().zip(acc.iter()) {
-            *o = a * s_inv;
-        }
-    } else {
-        out.copy_from_slice(acc);
     }
 }
 
 /// [`attend_head`] with FP32 value accumulators (upstream llama.cpp). `out` doubles as the per-chunk accumulator.
+/// Inlined into both versions of [`attend_head`].
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn attend_head_f32(
     q_f32: &[f32],

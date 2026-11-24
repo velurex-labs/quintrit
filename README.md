@@ -69,6 +69,8 @@ The quintrit kernels are compared with faithful Rust transcriptions of Microsoft
 
 The 5-trit kernels win where the BitNet kernel is close to the memory ceiling of the machine and lose where one core is compute-bound. These are kernel rates; a whole token also runs the F16 output projection and attention, which are the same for both encodings, so the gain per token is smaller. The full table, the method and the memory ceilings are in [`docs/benchmarks.md`](docs/benchmarks.md).
 
+The decode speed of whole models is reported in [`model_benchmarks/`](model_benchmarks/README.md): 17 ternary language models on four CPUs and two NVIDIA GPUs, with one page per model that holds the thread scaling, the long-prompt figures, the measurement conditions and the command to reproduce the numbers.
+
 ---
 
 ## Documentation
@@ -82,6 +84,7 @@ Full documentation and guides are available in [`docs/`](docs/):
 | [`docs/architecture.md`](docs/architecture.md) | System architecture, crate layout, tile formats, and memory pipeline |
 | [`docs/kernels.md`](docs/kernels.md) | Kernel implementations, exact arithmetic, and supported instruction sets |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmarking methodology, memory ceiling analysis, and hardware reports |
+| [`model_benchmarks/`](model_benchmarks/README.md) | Decode speed of 17 ternary models on four CPUs and two NVIDIA GPUs, one page per model |
 | [`docs/guides/`](docs/guides/) | Guides for Rust, C/C++, Python, the CLI and running on an NVIDIA GPU |
 
 ### Building & Testing
@@ -103,9 +106,9 @@ Planned milestones and future developments:
 
 - **Official Distribution:** Publish packages on [crates.io](https://crates.io) and [PyPI](https://pypi.org) with pre-built binary wheels for Linux, Windows, and macOS.
 - **Pre-Tiled Native Format & Direct `mmap`:** Introduce a dedicated file format / GGUF tensor type extension with pre-tiled velurex weights, enabling direct zero-copy memory mapping (`mmap`) straight from disk without startup transcoding or RAM allocation.
-- **Hardware Acceleration:** Further GPU backends, and GPU kernels for the block-scaled `Q2_0` models, mixture-of-experts and hybrid models, which run on the CPU only today (the NVIDIA CUDA backend covers the `I2_S` models).
+- **Hardware Acceleration:** Further GPU backends, and faster kernels for the block-scaled `Q2_0` models on the NVIDIA GPU (they are bit-exact, but their projection kernels have not been tuned yet).
 - **RISC-V Support:** Native kernels for RISC-V processors implementing the RVA23 profile, built on the mandatory RISC-V Vector Extension (RVV 1.0).
-- **Extended Benchmarks:** Full-model end-to-end decoding across additional CPU microarchitectures, including Apple processors (Apple Silicon M-series), alongside dedicated performance benchmarks for long context sequences.
+- **Extended Benchmarks:** Per-model benchmarks on additional CPU microarchitectures, including Apple processors (Apple Silicon M-series), alongside dedicated performance benchmarks for long context sequences.
 - **Edge Efficiency:** Telemetry-backed energy consumption profiling (Joules per decoded token) across edge platforms.
 - **Hardware-Level Implementation (FPGA & ASIC):** Explore dedicated digital architecture and hardware-level implementation possibilities (FPGA prototyping and ASIC designs) leveraging division-free velurex decoding for custom ternary accelerator cores.
 

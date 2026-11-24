@@ -21,6 +21,7 @@
 
 pub mod attention;
 pub mod config;
+pub(crate) mod dispatch;
 pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod gpu;

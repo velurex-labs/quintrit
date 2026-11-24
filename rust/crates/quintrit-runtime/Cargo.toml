@@ -50,6 +50,10 @@ harness = false
 name = "token_energy"
 harness = false
 
+[[bench]]
+name = "attention_threshold"
+harness = false
+
 [[example]]
 name = "gpu_decode_bench"
 required-features = ["cuda"]

@@ -9,8 +9,13 @@
 //! device memory, so the graph does not change from token to token.
 //!
 //! Supported: models whose projections are per-tensor-scaled ternary tensors (`I2_S`, uniformly scaled `TQ1_0` / `TQ2_0`), an `F16` token embedding and
-//! head (or a tied head), the bitnet.cpp attention numerics, head dimensions 32, 64, 128 and 256 and contexts of up to 7936 positions. Block-scaled
-//! (`Q2_0`), mixture-of-experts and hybrid models run on the CPU only.
+//! head (or a tied head), the bitnet.cpp attention numerics, head dimensions 32, 64, 128 and 256 and contexts of up to 7936 positions; and dense
+//! block-scaled (`Q2_0`) models (a `Q2_0` embedding and head, one scale per 64 weights, `Q8_0` activations, the llama.cpp attention numerics; see
+//! the module `q2`). Mixture-of-experts and hybrid models run on the CPU only.
+
+mod q2;
+mod nemotron;
+mod qwen35;
 
 use crate::config::{ActivationType, ModelConfig, Numerics, RopeConfig, RopeMode};
 use crate::ops::{f16_to_f32, rope_cache};
@@ -78,7 +83,14 @@ struct Buffers {
 /// The weights of one model on one GPU: the ternary matrices in the GPU layout, the norms, the output head and the rotary table. Immutable once loaded,
 /// shared by the sessions ([`GpuModel::new_session`]) and usable from several threads.
 pub struct GpuModel {
+    /// The layers of a model with per-tensor scales (empty for a block-scaled model).
     layers: Vec<GpuLayer>,
+    /// The weights of a block-scaled model (`layers`, `out_norm` and `head` are placeholders then).
+    q2: Option<q2::Q2Weights>,
+    /// The weights of a hybrid (Qwen3.5) model (`layers`, `out_norm` and `head` are placeholders then).
+    hybrid: Option<qwen35::HybridWeights>,
+    /// The weights of a Nemotron-H model (`layers`, `out_norm` and `head` are placeholders then).
+    nemotron: Option<nemotron::NemotronWeights>,
     out_norm: DeviceBuffer<f32>,
     head: DeviceBuffer<u16>,
     cos_sin: DeviceBuffer<f32>,
@@ -96,9 +108,14 @@ pub struct GpuModel {
 pub struct GpuSession {
     // The graph is declared first so that it is destroyed before the buffers it refers to.
     graph: Option<GraphExec>,
+    /// The graph of a token without the head (see [`GpuSession::prefill`]).
+    graph_prefill: Option<GraphExec>,
     k_cache: Vec<DeviceBuffer<u16>>,
     v_cache: Vec<DeviceBuffer<u16>>,
     buf: Buffers,
+    q2: Option<q2::Q2Buffers>,
+    hy: Option<qwen35::HybridBuffers>,
+    nm: Option<nemotron::NemotronBuffers>,
     emb_pin: PinnedBuffer<f32>,
     pos_pin: PinnedBuffer<i32>,
     logits_pin: PinnedBuffer<f32>,
@@ -148,8 +165,12 @@ impl GpuModel {
     /// Checks that the GPU decoder can run the model; the error says why not.
     pub fn check_supported(config: &ModelConfig, gguf: &GgufFile) -> Result<(), String> {
         use crate::config::ModelArchitecture::*;
-        if gguf.tensors.values().any(|t| t.tensor_type == GGML_TYPE_Q2_0) {
-            return Err("block-scaled (Q2_0) models run on the CPU only; the GPU decoder supports I2_S models".into());
+        if q2::is_block_scaled(gguf) {
+            return match config.architecture {
+                Qwen35 => qwen35::check_supported(config, gguf),
+                NemotronHMoe => nemotron::check_supported(config, gguf),
+                _ => q2::check_supported(config, gguf),
+            };
         }
         if matches!(config.architecture, Qwen35 | NemotronHMoe) {
             return Err("hybrid and mixture-of-experts models run on the CPU only".into());
@@ -190,15 +211,23 @@ impl GpuModel {
         let (hidden, inter) = (config.hidden_size, config.intermediate_size);
         let (hd, qh, kvh) = (config.head_dim, config.num_attention_heads, config.num_key_value_heads);
         let (q_dim, kv_dim) = (qh * hd, kvh * hd);
-        let rope = RopeConfig { freq_base: config.rope_theta, n_dims: config.rope.n_dims.min(hd), ..config.rope };
+        let hybrid = config.architecture == crate::config::ModelArchitecture::Qwen35;
+        let nemotron_arch = config.architecture == crate::config::ModelArchitecture::NemotronHMoe;
+        // A hybrid model rotates with the rope parameters of the file as they are, the other models take the base frequency and the width from the head.
+        let rope = if hybrid { config.rope } else { RopeConfig { freq_base: config.rope_theta, n_dims: config.rope.n_dims.min(hd), ..config.rope } };
         let rope_dims = rope.n_dims;
 
         let upload_f32 = |name: &str| -> Result<DeviceBuffer<f32>, String> {
             let v = gguf.get_tensor_f32(name).ok_or_else(|| format!("Missing {name}"))?;
             device.upload(&v).map_err(err)
         };
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for l in 0..config.num_hidden_layers {
+        let block_scaled = q2::is_block_scaled(gguf);
+        let hybrid_weights = if block_scaled && hybrid { Some(qwen35::load(gguf, config, &device)?) } else { None };
+        let nemotron_weights = if block_scaled && nemotron_arch { Some(nemotron::load(gguf, config, &device)?) } else { None };
+        let q2_weights = if block_scaled && !hybrid && !nemotron_arch { Some(q2::load(gguf, config, &device)?) } else { None };
+        let per_tensor_layers = if block_scaled { 0 } else { config.num_hidden_layers };
+        let mut layers = Vec::with_capacity(per_tensor_layers);
+        for l in 0..per_tensor_layers {
             let name = |n: &str| format!("blk.{l}.{n}.weight");
             let (q, k, v) = (
                 planar(gguf, &name("attn_q"), q_dim, hidden)?,
@@ -224,27 +253,40 @@ impl GpuModel {
                 ws: Scales { q: q.scale, k: k.scale, v: v.scale, o: o.scale, gate: gate.scale, up: up.scale, down: down.scale },
             });
         }
-        let out_norm = upload_f32("output_norm.weight")?;
-        let head_host = match gguf.get_tensor_f16("output.weight") {
-            Some(h) => h,
-            None => gguf.get_tensor_f16("token_embd.weight").ok_or_else(|| "Missing token_embd.weight tensor".to_string())?,
+        let (out_norm, head) = if block_scaled {
+            // The block-scaled weights carry their own norm and head.
+            (device.alloc_zeroed::<f32>(1).map_err(err)?, device.alloc_zeroed::<u16>(1).map_err(err)?)
+        } else {
+            let out_norm = upload_f32("output_norm.weight")?;
+            let head_host = match gguf.get_tensor_f16("output.weight") {
+                Some(h) => h,
+                None => gguf.get_tensor_f16("token_embd.weight").ok_or_else(|| "Missing token_embd.weight tensor".to_string())?,
+            };
+            if head_host.len() != config.vocab_size * hidden {
+                return Err(format!("the output head has {} values, expected {}", head_host.len(), config.vocab_size * hidden));
+            }
+            (out_norm, device.upload(head_host).map_err(err)?)
         };
-        if head_host.len() != config.vocab_size * hidden {
-            return Err(format!("the output head has {} values, expected {}", head_host.len(), config.vocab_size * hidden));
-        }
-        let head = device.upload(head_host).map_err(err)?;
 
         // The cos / sin pairs of every position, built on the host with the CPU runtime's own routine (so with the platform's libm, as the CPU path does).
-        let mut table = Vec::with_capacity(context * rope_dims);
+        // A model without rotary embedding (Nemotron-H) has no table.
+        let rope_dims = if nemotron_arch { 0 } else { rope_dims };
+        let mut table = Vec::with_capacity(context * rope_dims + 1);
         let mut c = Vec::new();
-        for p in 0..context {
-            rope_cache(p, &rope, &mut c);
-            table.extend_from_slice(&c);
+        if !nemotron_arch {
+            for p in 0..context {
+                rope_cache(p, &rope, &mut c);
+                table.extend_from_slice(&c);
+            }
         }
+        table.push(0.0);
         let cos_sin = device.upload(&table).map_err(err)?;
 
         Ok(GpuModel {
             layers,
+            q2: q2_weights,
+            hybrid: hybrid_weights,
+            nemotron: nemotron_weights,
             out_norm,
             head,
             cos_sin,
@@ -300,7 +342,13 @@ impl GpuModel {
         let (q_dim, kv_dim) = (qh * hd, kvh * hd);
         let cache_elems = kvh * context * hd;
         let (mut k_cache, mut v_cache) = (Vec::new(), Vec::new());
-        for _ in 0..config.num_hidden_layers {
+        // A hybrid model has a KV cache in its attention layers only.
+        let cache_layers = match (&self.hybrid, &self.nemotron) {
+            (Some(h), _) => h.attn_layers(),
+            (_, Some(n)) => n.attn_layers(),
+            _ => config.num_hidden_layers,
+        };
+        for _ in 0..cache_layers {
             k_cache.push(device.alloc_zeroed::<u16>(cache_elems).map_err(err)?);
             v_cache.push(device.alloc_zeroed::<u16>(cache_elems).map_err(err)?);
         }
@@ -324,11 +372,24 @@ impl GpuModel {
             pos: device.alloc_zeroed(1).map_err(err)?,
             attn_ws: AttentionWorkspace::new(device, config.num_attention_heads, config.head_dim).map_err(err)?,
         };
+        let q2 = if self.q2.is_some() { Some(q2::Q2Buffers::new(device, config)?) } else { None };
+        let hy = match &self.hybrid {
+            Some(w) => Some(qwen35::HybridBuffers::new(device, config, w)?),
+            None => None,
+        };
+        let nm = match &self.nemotron {
+            Some(w) => Some(nemotron::NemotronBuffers::new(device, config, w)?),
+            None => None,
+        };
         Ok(GpuSession {
             graph: None,
+            graph_prefill: None,
             k_cache,
             v_cache,
             buf,
+            q2,
+            hy,
+            nm,
             emb_pin: device.alloc_pinned(hidden).map_err(err)?,
             pos_pin: device.alloc_pinned(1).map_err(err)?,
             logits_pin: device.alloc_pinned(config.vocab_size).map_err(err)?,
@@ -346,6 +407,30 @@ impl GpuSession {
     pub fn time_token(&mut self, embedding: &[u16], pos: usize, blocks: usize, iterations: usize) -> Result<Vec<f64>, String> {
         let mut logits = vec![0f32; self.model.cfg.vocab_size];
         self.forward(embedding, pos, &mut logits)?;
+        self.time_graph(blocks, iterations)
+    }
+
+    /// [`GpuSession::time_token`] for a block-scaled model, whose embedding row is given as F32 values.
+    pub fn time_token_f32(&mut self, embedding: &[f32], pos: usize, blocks: usize, iterations: usize) -> Result<Vec<f64>, String> {
+        let mut logits = vec![0f32; self.model.cfg.vocab_size];
+        self.forward_f32(embedding, pos, &mut logits)?;
+        self.time_graph(blocks, iterations)
+    }
+
+    /// Records the device work of one token, whichever kind of model it is.
+    fn enqueue_any(&self, head: bool) -> quintrit_cuda::Result<()> {
+        if self.model.nemotron.is_some() {
+            self.enqueue_nemotron(head)
+        } else if self.model.hybrid.is_some() {
+            self.enqueue_qwen35(head)
+        } else if self.model.q2.is_some() {
+            self.enqueue_q2(head)
+        } else {
+            self.enqueue(head)
+        }
+    }
+
+    fn time_graph(&mut self, blocks: usize, iterations: usize) -> Result<Vec<f64>, String> {
         if !self.model.use_graph {
             return Err("timing needs the CUDA graph (QUINTRIT_CUDA_GRAPH is 0)".into());
         }
@@ -386,7 +471,7 @@ impl GpuSession {
     }
 
     /// Records the device work of one token (the position comes from device memory).
-    fn enqueue(&self) -> quintrit_cuda::Result<()> {
+    fn enqueue(&self, head: bool) -> quintrit_cuda::Result<()> {
         let c = &self.model.cfg;
         let st = &self.stream;
         let b = &self.buf;
@@ -448,6 +533,9 @@ impl GpuSession {
                 self.model.layer.residual_add(st, &b.h, &b.down_out, &b.act_scale, w.ws.down, hidden)?;
             }
         }
+        if !head {
+            return Ok(());
+        }
         self.model.layer.final_norm(st, &b.h, &self.model.out_norm, &b.xn, hidden, eps)?;
         self.model.layer.lm_head(st, &self.model.head, &b.xn, &b.logits, c.vocab_size, hidden)
     }
@@ -461,35 +549,103 @@ impl GpuSession {
         if embedding.len() != hidden {
             return Err(format!("embedding row has {} values, expected {hidden}", embedding.len()));
         }
-        if pos >= self.context {
-            return Err(format!("position {pos} is outside the GPU context window of {} positions", self.context));
-        }
-        if logits.len() != self.model.cfg.vocab_size {
-            return Err("the logits buffer must match the vocabulary size".into());
+        if self.model.q2.is_some() || self.model.hybrid.is_some() || self.model.nemotron.is_some() {
+            return Err("a block-scaled model takes the embedding as F32 values (GpuSession::forward_f32)".into());
         }
         for (o, &e) in self.emb_pin.as_mut_slice().iter_mut().zip(embedding) {
             *o = f16_to_f32(e);
         }
+        self.run(pos, Some(logits))
+    }
+
+    /// [`GpuSession::forward`] with the embedding row of the token as F32 values (the form of a block-scaled model, whose embedding is dequantized on the host).
+    pub fn forward_f32(&mut self, embedding: &[f32], pos: usize, logits: &mut [f32]) -> Result<(), String> {
+        let hidden = self.model.cfg.hidden_size;
+        if embedding.len() != hidden {
+            return Err(format!("embedding row has {} values, expected {hidden}", embedding.len()));
+        }
+        if self.model.q2.is_none() && self.model.hybrid.is_none() && self.model.nemotron.is_none() {
+            return Err("a model with per-tensor scales takes the embedding as F16 bit patterns (GpuSession::forward)".into());
+        }
+        self.emb_pin.as_mut_slice().copy_from_slice(embedding);
+        self.run(pos, Some(logits))
+    }
+
+    /// [`GpuSession::forward`] for a prompt position whose logits nobody reads: the final norm, the vocabulary projection and the copy of the logits
+    /// are left out (the cache it writes is the same).
+    pub fn prefill(&mut self, embedding: &[u16], pos: usize) -> Result<(), String> {
+        let hidden = self.model.cfg.hidden_size;
+        if embedding.len() != hidden {
+            return Err(format!("embedding row has {} values, expected {hidden}", embedding.len()));
+        }
+        if self.model.q2.is_some() || self.model.hybrid.is_some() || self.model.nemotron.is_some() {
+            return Err("a block-scaled model takes the embedding as F32 values (GpuSession::prefill_f32)".into());
+        }
+        for (o, &e) in self.emb_pin.as_mut_slice().iter_mut().zip(embedding) {
+            *o = f16_to_f32(e);
+        }
+        self.run(pos, None)
+    }
+
+    /// [`GpuSession::prefill`] with the embedding row as F32 values (the form of a block-scaled model).
+    pub fn prefill_f32(&mut self, embedding: &[f32], pos: usize) -> Result<(), String> {
+        let hidden = self.model.cfg.hidden_size;
+        if embedding.len() != hidden {
+            return Err(format!("embedding row has {} values, expected {hidden}", embedding.len()));
+        }
+        if self.model.q2.is_none() && self.model.hybrid.is_none() && self.model.nemotron.is_none() {
+            return Err("a model with per-tensor scales takes the embedding as F16 bit patterns (GpuSession::prefill)".into());
+        }
+        self.emb_pin.as_mut_slice().copy_from_slice(embedding);
+        self.run(pos, None)
+    }
+
+    /// Runs the token whose embedding is in `emb_pin`; with `logits` `None` the token is run without the head and the host does not wait for a result
+    /// beyond the end of the work (the pinned input buffers are reused by the next token).
+    fn run(&mut self, pos: usize, logits: Option<&mut [f32]>) -> Result<(), String> {
+        let hidden = self.model.cfg.hidden_size;
+        if pos >= self.context {
+            return Err(format!("position {pos} is outside the GPU context window of {} positions", self.context));
+        }
+        if logits.as_ref().is_some_and(|l| l.len() != self.model.cfg.vocab_size) {
+            return Err("the logits buffer must match the vocabulary size".into());
+        }
+        let head = logits.is_some();
         self.pos_pin.as_mut_slice()[0] = pos as i32;
         self.emb_pin.copy_to_device_async(&self.buf.h, hidden, &self.stream).map_err(err)?;
         self.pos_pin.copy_to_device_async(&self.buf.pos, 1, &self.stream).map_err(err)?;
         if self.model.use_graph {
-            if self.graph.is_none() {
+            if self.graph_slot(head).is_none() {
                 self.stream.begin_capture().map_err(err)?;
-                let recorded = self.enqueue();
+                let recorded = self.enqueue_any(head);
                 let captured: Result<Graph, _> = self.stream.end_capture();
                 recorded.map_err(err)?;
-                self.graph = Some(captured.map_err(err)?.instantiate().map_err(err)?);
+                let exec = captured.map_err(err)?.instantiate().map_err(err)?;
+                *self.graph_slot(head) = Some(exec);
             }
-            self.graph.as_ref().expect("graph was just created").launch(&self.stream).map_err(err)?;
+            let graph = if head { &self.graph } else { &self.graph_prefill };
+            graph.as_ref().expect("graph was just created").launch(&self.stream).map_err(err)?;
         } else {
-            self.enqueue().map_err(err)?;
+            self.enqueue_any(head).map_err(err)?;
         }
-        let vocab = self.model.cfg.vocab_size;
-        self.logits_pin.copy_from_device_async(&self.buf.logits, vocab, &self.stream).map_err(err)?;
-        self.stream.synchronize().map_err(err)?;
-        logits.copy_from_slice(&self.logits_pin.as_slice()[..vocab]);
+        if let Some(logits) = logits {
+            let vocab = self.model.cfg.vocab_size;
+            self.logits_pin.copy_from_device_async(&self.buf.logits, vocab, &self.stream).map_err(err)?;
+            self.stream.synchronize().map_err(err)?;
+            logits.copy_from_slice(&self.logits_pin.as_slice()[..vocab]);
+        } else {
+            self.stream.synchronize().map_err(err)?;
+        }
         Ok(())
+    }
+
+    /// The slot of the CUDA graph with (`head`) or without the vocabulary projection.
+    fn graph_slot(&mut self, head: bool) -> &mut Option<GraphExec> {
+        if head {
+            &mut self.graph
+        } else {
+            &mut self.graph_prefill
+        }
     }
 }
 
@@ -534,8 +690,28 @@ impl GpuDecoder {
         self.session.forward(embedding, pos, logits)
     }
 
+    /// See [`GpuSession::forward_f32`].
+    pub fn forward_f32(&mut self, embedding: &[f32], pos: usize, logits: &mut [f32]) -> Result<(), String> {
+        self.session.forward_f32(embedding, pos, logits)
+    }
+
+    /// See [`GpuSession::prefill`].
+    pub fn prefill(&mut self, embedding: &[u16], pos: usize) -> Result<(), String> {
+        self.session.prefill(embedding, pos)
+    }
+
+    /// See [`GpuSession::prefill_f32`].
+    pub fn prefill_f32(&mut self, embedding: &[f32], pos: usize) -> Result<(), String> {
+        self.session.prefill_f32(embedding, pos)
+    }
+
     /// See [`GpuSession::time_token`].
     pub fn time_token(&mut self, embedding: &[u16], pos: usize, blocks: usize, iterations: usize) -> Result<Vec<f64>, String> {
         self.session.time_token(embedding, pos, blocks, iterations)
+    }
+
+    /// See [`GpuSession::time_token_f32`].
+    pub fn time_token_f32(&mut self, embedding: &[f32], pos: usize, blocks: usize, iterations: usize) -> Result<Vec<f64>, String> {
+        self.session.time_token_f32(embedding, pos, blocks, iterations)
     }
 }

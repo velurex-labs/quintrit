@@ -326,6 +326,11 @@ fn open_gpu_model(path: &str, opts: Option<GpuOptions>) -> Res<ModelHandle> {
             Failure::new(code, m)
         })?
     };
+    // The sessions of the C interface take the F16 embedding table of the model; a block-scaled model keeps its embedding in another form that only the Rust API and
+    // the Python package (which use the engine) handle.
+    if engine.model.token_embeddings.is_empty() {
+        fail!(QUINTRIT_ERR_UNSUPPORTED, "block-scaled (Q2_0) models run on a GPU through the Rust API, the CLI and the Python package; the C interface does not support them there yet");
+    }
     let weights = engine.gpu_model().cloned();
     let InferenceEngine { model, tokenizer, .. } = engine;
     Ok(ModelHandle {
@@ -334,17 +339,28 @@ fn open_gpu_model(path: &str, opts: Option<GpuOptions>) -> Res<ModelHandle> {
     })
 }
 
-/// One forward pass of a session on its device.
-fn forward_one(model: &ModelInner, st: &mut SessionState, token: u32, pos: usize) -> Res<()> {
+/// One forward pass of a session on its device. With `need_logits` false (a prompt token that is not the last one) the final norm and the vocabulary
+/// projection are skipped (on the GPU by a second CUDA graph); the logits are then left as they were.
+fn forward_one(model: &ModelInner, st: &mut SessionState, token: u32, pos: usize, need_logits: bool) -> Res<()> {
     #[cfg(feature = "cuda")]
     if let Some(gpu) = st.gpu.as_mut() {
         let hidden = model.model.config.hidden_size;
         let off = token as usize * hidden;
-        gpu.forward(&model.model.token_embeddings[off..off + hidden], pos, &mut st.logits).map_err(|m| Failure::new(QUINTRIT_ERR_DEVICE, m))?;
+        let row = &model.model.token_embeddings[off..off + hidden];
+        if need_logits {
+            gpu.forward(row, pos, &mut st.logits)
+        } else {
+            gpu.prefill(row, pos)
+        }
+        .map_err(|m| Failure::new(QUINTRIT_ERR_DEVICE, m))?;
         st.kv.mark_position(pos);
         return Ok(());
     }
-    model.model.forward_token_with_scratchpad(token, pos, &mut st.kv, &mut st.scratch, &mut st.logits);
+    if need_logits {
+        model.model.forward_token_with_scratchpad(token, pos, &mut st.kv, &mut st.scratch, &mut st.logits);
+    } else {
+        model.model.prefill_token_with_scratchpad(token, pos, &mut st.kv, &mut st.scratch);
+    }
     Ok(())
 }
 
@@ -426,7 +442,7 @@ fn generate(
     let llama_like = matches!(model.model.config.architecture, ModelArchitecture::BitNet | ModelArchitecture::Llama);
 
     for (i, &tok) in tokens.iter().enumerate() {
-        forward_one(&model, st, tok, pos0 + i)?;
+        forward_one(&model, st, tok, pos0 + i, i + 1 == tokens.len())?;
     }
     let mut pos = pos0 + tokens.len();
 
@@ -481,7 +497,7 @@ fn generate(
             break;
         }
         // Feed the token (also after a callback stop, so that the cache matches the text the caller has seen).
-        forward_one(&model, st, next, pos)?;
+        forward_one(&model, st, next, pos, true)?;
         pos += 1;
         if halt {
             break;

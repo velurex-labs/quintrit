@@ -27,6 +27,9 @@ fn main() {
         }
     };
     println!("device: {}", engine.gpu_device_name().unwrap_or_default());
+    if let Some(Ok((free, total))) = engine.gpu_model().map(|m| m.memory_info()) {
+        println!("device memory in use: {} MiB of {} MiB", (total - free) >> 20, total >> 20);
+    }
     for context in contexts {
         let mut blocks = engine.time_gpu_decode(context, 5, 200).unwrap_or_else(|e| {
             eprintln!("{e}");

@@ -219,7 +219,7 @@ build, the driver is loaded at run time):
 
 All of them exist in every build. Without GPU support they return `QUINTRIT_ERR_UNSUPPORTED`, so one program works against both builds.
 Tokenizing, sessions and generation use the same functions as for a CPU model; every session of a GPU model keeps its KV cache on the
-device and shares the weights. The results are bit-identical to the CPU path. `I2_S` models are supported; other model kinds return
+device and shares the weights. The results are bit-identical to the CPU path. `I2_S` models are supported (block-scaled `Q2_0` models run on a GPU through the Rust API, the CLI and the Python package, not through this interface); other model kinds return
 `QUINTRIT_ERR_UNSUPPORTED`, and driver errors or a lack of device memory return `QUINTRIT_ERR_DEVICE`. `quintrit_model_info` reports
 kernel `QUINTRIT_KERNEL_AUTO` and 0 threads for a GPU model, and session context lengths are rounded down to a multiple of 256.
 In C++ use `quintrit::Model::open_gpu(path, device, context)` and `Model::on_gpu()`. See [the GPU guide](../../../docs/guides/gpu.md)

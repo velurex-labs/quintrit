@@ -333,7 +333,8 @@ __device__ __forceinline__ void load_halves(const __half* p, float* v) {
 // fast, eight and one are slower (RTX 3070).
 constexpr int EPT = 2;
 
-template <int HD>
+// F32 selects the arithmetic of upstream llama.cpp (query kept in F32, scores as ggml_vec_dot_f16_f32, F32 value accumulator) instead of the bitnet.cpp one.
+template <int HD, bool F32>
 __device__ __forceinline__ void attention_body(const __half* __restrict__ K, const __half* __restrict__ V, const float* __restrict__ q, float* __restrict__ out,
                                                float* __restrict__ part, unsigned* __restrict__ arrivals, int gqa, int cache_len, float scale,
                                                const int* __restrict__ pos_dev, int l_chunk) {
@@ -361,7 +362,7 @@ __device__ __forceinline__ void attention_body(const __half* __restrict__ K, con
 #pragma unroll
     for (int e = 0; e < EPT; ++e) xs[e] = 0.f;
     if (n > 0) {  // block-uniform: a chunk of masked cells only has S = 0 and takes no part in the combination
-        if (d < HD) qs[d] = __half2float(__float2half(q[h * HD + d]));
+        if (d < HD) qs[d] = F32 ? q[h * HD + d] : __half2float(__float2half(q[h * HD + d]));
         if (d < ATTN_MAX_L / ATTN_CHUNKS / 32 + 2) tile_rescale[d] = 0;
         __syncthreads();
         __half* tilebase = reinterpret_cast<__half*>(sm + ((2 * l_chunk + 3) & ~3));
@@ -399,10 +400,17 @@ __device__ __forceinline__ void attention_body(const __half* __restrict__ K, con
                 float r[8];
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
-                    const float s = acc[e] + __shfl_xor_sync(0xffffffffu, acc[e], 2);  // (a0 + a2) in lanes 0 and 2, (a1 + a3) in lanes 1 and 3
-                    r[e] = s + __shfl_xor_sync(0xffffffffu, s, 1);                     // (a0 + a2) + (a1 + a3)
+                    if constexpr (F32) {
+                        const float s = acc[e] + __shfl_xor_sync(0xffffffffu, acc[e], 1);  // (a0 + a1) in lanes 0 and 1, (a2 + a3) in lanes 2 and 3
+                        r[e] = s + __shfl_xor_sync(0xffffffffu, s, 2);                     // (a0 + a1) + (a2 + a3)
+                    } else {
+                        const float s = acc[e] + __shfl_xor_sync(0xffffffffu, acc[e], 2);  // (a0 + a2) in lanes 0 and 2, (a1 + a3) in lanes 1 and 3
+                        r[e] = s + __shfl_xor_sync(0xffffffffu, s, 1);                     // (a0 + a2) + (a1 + a3)
+                    }
                 }
-                const float dot = ((r[0] + r[4]) + (r[1] + r[5])) + ((r[2] + r[6]) + (r[3] + r[7]));
+                float dot;
+                if constexpr (F32) dot = ((r[0] + r[4]) + (r[2] + r[6])) + ((r[1] + r[5]) + (r[3] + r[7]));  // ggml_vec_dot_f16_f32
+                else dot = ((r[0] + r[4]) + (r[1] + r[5])) + ((r[2] + r[6]) + (r[3] + r[7]));
                 if (t == 0 && pb + qd < ce) vsa[pb + qd - cs] = __fmul_rn(dot, scale);
             }
         }
@@ -489,7 +497,10 @@ __device__ __forceinline__ void attention_body(const __half* __restrict__ K, con
                         load_halves<EPT>(vb + t * HD, v);
                         s_sum = s_sum + vs;
 #pragma unroll
-                        for (int e = 0; e < EPT; ++e) xs[e] = __half2float(__float2half(fmaf(v[e], vs, xs[e])));
+                        for (int e = 0; e < EPT; ++e) {
+                            if constexpr (F32) xs[e] = fmaf(v[e], vs, xs[e]);
+                            else xs[e] = __half2float(__float2half(fmaf(v[e], vs, xs[e])));
+                        }
                     }
                 } else {
 #pragma unroll 4
@@ -500,8 +511,13 @@ __device__ __forceinline__ void attention_body(const __half* __restrict__ K, con
                         s_sum = fmaf(s_sum, ms, vs);
 #pragma unroll
                         for (int e = 0; e < EPT; ++e) {
-                            if (ms != 1.0f) xs[e] = __half2float(__float2half(xs[e] * ms));
-                            xs[e] = __half2float(__float2half(fmaf(v[e], vs, xs[e])));
+                            if constexpr (F32) {
+                                if (ms != 1.0f) xs[e] = __fmul_rn(xs[e], ms);
+                                xs[e] = fmaf(v[e], vs, xs[e]);
+                            } else {
+                                if (ms != 1.0f) xs[e] = __half2float(__float2half(xs[e] * ms));
+                                xs[e] = __half2float(__float2half(fmaf(v[e], vs, xs[e])));
+                            }
                         }
                     }
                 }
@@ -567,14 +583,18 @@ __device__ __forceinline__ void attention_body(const __half* __restrict__ K, con
     }
 }
 
-#define ATTENTION_ENTRY(HD)                                                                                                                         \
-    extern "C" __global__ void __launch_bounds__(NT, 2) attention_h##HD(const __half* __restrict__ K, const __half* __restrict__ V,                   \
+#define ATTENTION_ENTRY(HD, SUFFIX, F32)                                                                                                            \
+    extern "C" __global__ void __launch_bounds__(NT, 2) attention_h##HD##SUFFIX(const __half* __restrict__ K, const __half* __restrict__ V,         \
                                                                      const float* __restrict__ q, float* __restrict__ out,                       \
                                                                      float* __restrict__ part, unsigned* __restrict__ arrivals, int gqa,         \
                                                                      int cache_len, float scale, const int* __restrict__ pos_dev, int l_chunk) { \
-        attention_body<HD>(K, V, q, out, part, arrivals, gqa, cache_len, scale, pos_dev, l_chunk);                                                  \
+        attention_body<HD, F32>(K, V, q, out, part, arrivals, gqa, cache_len, scale, pos_dev, l_chunk);                                             \
     }
-ATTENTION_ENTRY(32)
-ATTENTION_ENTRY(64)
-ATTENTION_ENTRY(128)
-ATTENTION_ENTRY(256)
+ATTENTION_ENTRY(32, , false)
+ATTENTION_ENTRY(64, , false)
+ATTENTION_ENTRY(128, , false)
+ATTENTION_ENTRY(256, , false)
+ATTENTION_ENTRY(32, _f32, true)
+ATTENTION_ENTRY(64, _f32, true)
+ATTENTION_ENTRY(128, _f32, true)
+ATTENTION_ENTRY(256, _f32, true)
